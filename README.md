@@ -116,7 +116,7 @@ unit._request(query)
 This prints the primary record, the `status` object. Most of the valid queries and commands were discovered by snooping the traffic between the Kumo Cloud app and the indoor unit. A few were determined by experimentation. It's possible that additional values and controls are available beyond those already discovered, especially on indoor units newer than those owned by this author. I welcome details on these via pull requests or issues on this repo.
 
 ### Capture API Traffic
-To help discover more of the protocol, pykumo can record every exchange it has with indoor-unit adapters, the Kumo Cloud REST API and the Kumo Cloud Socket.IO channel. Events go to the `pykumo.traffic` logger at DEBUG level, one JSON object per line, with passwords, cryptoSerials, tokens and account credentials masked:
+To help discover more of the protocol, pykumo can record every exchange it has with indoor-unit adapters, the Kumo Cloud REST API and the Kumo Cloud Socket.IO channel. Events go to the `pykumo.traffic` logger at DEBUG level, one JSON object per line, with passwords, cryptoSerials, tokens, account credentials and the account holder's name and phone number masked:
 ```
 import logging
 handler = logging.FileHandler("kumo_traffic.jsonl")

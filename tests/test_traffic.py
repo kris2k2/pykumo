@@ -78,6 +78,18 @@ class TestTrafficHelpers(_TrafficTestCase):
         self.assertEqual(device["Password"], traffic.REDACTED)
         self.assertEqual(device["cryptoSerial"], traffic.REDACTED)
 
+    def test_personal_details_redacted(self):
+        # As in the /v3/login answer.
+        traffic.log_event(
+            "cloud",
+            "recv",
+            body={"firstName": "Ann", "lastName": "Lee", "phone": "5550100", "id": "1"},
+        )
+        body = self.capture.events[0]["body"]
+        for key in ("firstName", "lastName", "phone"):
+            self.assertEqual(body[key], traffic.REDACTED)
+        self.assertEqual(body["id"], "1")
+
     def test_empty_secret_values_are_left_visible(self):
         traffic.log_event("cloud", "recv", body={"password": ""})
         self.assertEqual(self.capture.events[0]["body"]["password"], "")
