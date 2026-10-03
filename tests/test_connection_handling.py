@@ -6,6 +6,7 @@ requests it received.
 """
 
 import json
+import socket
 import threading
 import time
 import unittest
@@ -64,12 +65,22 @@ _RESPONSE = {
 }
 
 
+def _peer_closed(sock) -> bool:
+    """True if the client has already closed this connection (FIN received)."""
+    try:
+        return sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+    except BlockingIOError:
+        return False  # open, nothing to read yet
+    except OSError:
+        return True
+
+
 class _FakeAdapter:
     """Threaded HTTP server that tracks concurrent connections."""
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.open = 0
+        self.connections = set()  # sockets whose handler hasn't finished
         self.max_open = 0
         self.requests = 0
         self.last_headers = None
@@ -84,15 +95,20 @@ class _FakeAdapter:
             def setup(self):
                 super().setup()
                 with adapter.lock:
-                    adapter.open += 1
-                    adapter.max_open = max(adapter.max_open, adapter.open)
+                    # A handler only notices the client's FIN when it next
+                    # reads, which can be after the client has already
+                    # opened its next connection. Count only connections
+                    # the client still has open.
+                    still_open = [c for c in adapter.connections if not _peer_closed(c)]
+                    adapter.connections.add(self.connection)
+                    adapter.max_open = max(adapter.max_open, len(still_open) + 1)
 
             def finish(self):
                 try:
                     super().finish()
                 finally:
                     with adapter.lock:
-                        adapter.open -= 1
+                        adapter.connections.discard(self.connection)
 
             def log_message(self, *args):
                 pass
