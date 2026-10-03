@@ -17,8 +17,17 @@ UNIT_RESPONSE_TIMEOUT_SECONDS = 8.0
 # per second.
 UNIT_MIN_REQUEST_INTERVAL_SECONDS = 0.25
 
+# The unit profile (capabilities and setpoint limits) only changes if the
+# installer reconfigures the unit, so it's re-read at most this often rather
+# than on every poll, saving the adapter a request per poll.
+PROFILE_REFRESH_SECONDS = 3600
+
+# Units without an MHK2 thermostat answer the MHK2 query with all-null
+# values. Once that's been seen, only ask again after this long.
+MHK2_RECHECK_SECONDS = 600
+
 # How many recent adapter request round-trips get_request_latency() covers.
-# A poll issues about four requests, so this spans the last few polls.
+# A poll issues three to five requests, so this spans the last few polls.
 REQUEST_LATENCY_SAMPLES = 10
 
 # Default timeouts for interacting with the Kumo Cloud
