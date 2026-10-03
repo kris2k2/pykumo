@@ -14,6 +14,7 @@ from requests.exceptions import Timeout
 from urllib3.util import SKIP_HEADER
 from . import traffic
 from .const import (
+    REQUEST_LATENCY_SAMPLES,
     CACHE_INTERVAL_SECONDS,
     W_PARAM,
     S_PARAM,
@@ -232,6 +233,8 @@ class PyKumoBase:
         self._min_request_interval = max(0.0, float(min_request_interval))
         self._status = {}
         self._profile = {}
+        # Round-trip seconds of recent requests that got an answer.
+        self._request_latencies = collections.deque(maxlen=REQUEST_LATENCY_SAMPLES)
         self._sensors = []
         self._last_status_update = time.monotonic() - 2 * CACHE_INTERVAL_SECONDS
 
@@ -384,6 +387,8 @@ class PyKumoBase:
                 # body is already fully read so urllib3 can return the
                 # connection to the pool cleanly rather than abandoning it.
                 content = response.content
+                elapsed = time.monotonic() - started
+                self._request_latencies.append(elapsed)
                 traffic.log_event(
                     "local",
                     "recv",
@@ -391,7 +396,7 @@ class PyKumoBase:
                     address=self._address,
                     attempt=attempt,
                     status=response.status_code,
-                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                    elapsed_ms=round(elapsed * 1000),
                     body=traffic.decode_body(content),
                 )
                 response.close()
@@ -470,6 +475,29 @@ class PyKumoBase:
         if not hasattr(_tl, "failed_cycles"):
             _tl.failed_cycles = set()
         _tl.failed_cycles.add(self._address)
+
+    def get_request_latency(self):
+        """Return round-trip times of recent requests to the adapter.
+
+        Covers the last REQUEST_LATENCY_SAMPLES requests that got an
+        answer, timed from sending the request to receiving the full
+        response. Time spent waiting for the adapter to be free (other
+        threads' requests, rate limiting) is not included, nor are requests
+        that timed out or failed to connect.
+
+        Returns a dict of milliseconds -- last, average, min, max -- plus
+        the number of samples, or None if no request has completed yet.
+        """
+        samples = list(self._request_latencies)
+        if not samples:
+            return None
+        return {
+            "last": round(samples[-1] * 1000, 1),
+            "average": round(sum(samples) / len(samples) * 1000, 1),
+            "min": round(min(samples) * 1000, 1),
+            "max": round(max(samples) * 1000, 1),
+            "samples": len(samples),
+        }
 
     def has_profile(self) -> bool:
         """Return True if the unit profile has been populated from a successful poll.

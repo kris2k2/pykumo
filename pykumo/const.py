@@ -17,6 +17,10 @@ UNIT_RESPONSE_TIMEOUT_SECONDS = 8.0
 # per second.
 UNIT_MIN_REQUEST_INTERVAL_SECONDS = 0.25
 
+# How many recent adapter request round-trips get_request_latency() covers.
+# A poll issues about four requests, so this spans the last few polls.
+REQUEST_LATENCY_SAMPLES = 10
+
 # Default timeouts for interacting with the Kumo Cloud
 KUMO_CONNECT_TIMEOUT_SECONDS = 5
 KUMO_RESPONSE_TIMEOUT_SECONDS = 60
