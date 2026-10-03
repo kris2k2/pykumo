@@ -473,8 +473,15 @@ class PyKumo(PyKumoBase):
             val = None
         return val
 
-    def get_fan_speeds(self):
-        """List of valid fan speeds for unit"""
+    def get_fan_speeds(self, include_undeclared=False):
+        """List of valid fan speeds for unit.
+
+        By default this is what the unit's profile declares. Some units are
+        said to accept speeds beyond the ones they declare (superQuiet and
+        superPowerful on units reporting 3 speeds); ``include_undeclared``
+        adds whichever of those two ends of the range the unit leaves out.
+        They may not differ from the nearest declared speed on a given unit.
+        """
         try:
             speeds = self._profile["numberOfFanSpeeds"]
         except KeyError:
@@ -487,15 +494,16 @@ class PyKumo(PyKumoBase):
             )
 
         if speeds == 3:
-            # Intentionally return all 5 speeds even though the profile reports
-            # numberOfFanSpeeds=3.  These units under-report their capability:
-            # real hardware accepts the full superQuiet..superPowerful range,
-            # as confirmed on units in the field.
-            valid_speeds = ["superQuiet", "quiet", "low", "powerful", "superPowerful"]
+            valid_speeds = ["quiet", "low", "powerful"]
         elif speeds == 4:
             valid_speeds = ["quiet", "Low", "powerful", "superPowerful"]
         else:
             valid_speeds = ["superQuiet", "quiet", "low", "powerful", "superPowerful"]
+        if include_undeclared:
+            if "superQuiet" not in valid_speeds:
+                valid_speeds.insert(0, "superQuiet")
+            if "superPowerful" not in valid_speeds:
+                valid_speeds.append("superPowerful")
         try:
             if self._profile["hasFanSpeedAuto"]:
                 valid_speeds.append("auto")
@@ -755,11 +763,15 @@ class PyKumo(PyKumoBase):
         if speed not in ALL_FAN_SPEEDS + ["auto"]:
             _LOGGER.warning("Attempting to set invalid fan speed %s", speed)
             return {}
-        valid_speeds = self.get_fan_speeds()
-        if speed not in valid_speeds:
-            _LOGGER.warning(
-                "Unit does not report fan speed %s as supported. Setting anyway", speed
+        if speed not in self.get_fan_speeds():
+            # Undeclared speeds are an opt-in (get_fan_speeds's
+            # include_undeclared), so sending one isn't worth a warning.
+            log = (
+                _LOGGER.info
+                if speed in self.get_fan_speeds(include_undeclared=True)
+                else _LOGGER.warning
             )
+            log("Unit does not report fan speed %s as supported. Setting anyway", speed)
         command = (
             '{"c": { "indoorUnit": { "status": { "fanSpeed": "%s" } } } }' % speed
         ).encode("utf-8")
