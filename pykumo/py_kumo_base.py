@@ -8,6 +8,7 @@ import logging
 import threading
 import requests
 from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout
 from .const import (
     CACHE_INTERVAL_SECONDS,
@@ -26,14 +27,36 @@ _LOGGER = logging.getLogger(__name__)
 # thread-safe, so a per-thread store is required.
 _tl = threading.local()
 
+# Process-wide, per-adapter locks. Thread-local sessions alone do not bound
+# the number of connections to an adapter: HA's executor can run a poll and
+# one or more commands (or two polls) for the same unit on different threads
+# at once, each with its own session and socket. The adapters have very few
+# socket slots, so all traffic to a given address is serialized here: at most
+# one in-flight request (and one TCP connection) per adapter per process.
+# RLock so that requests nested inside a cycle on the same thread (e.g.
+# do_reboot() or schedule fetch() during update_status()) don't deadlock.
+_unit_locks: dict[str, threading.RLock] = {}
+_unit_locks_guard = threading.Lock()
+
+
+def _get_unit_lock(address: str) -> threading.RLock:
+    """Return the process-wide lock serializing traffic to address."""
+    with _unit_locks_guard:
+        lock = _unit_locks.get(address)
+        if lock is None:
+            lock = threading.RLock()
+            _unit_locks[address] = lock
+        return lock
+
 
 def _get_session(address: str) -> requests.Session:
     """Return a persistent Session for (current_thread, address).
 
     Creates a new Session on first access per thread. pool_connections=1
     and pool_maxsize=1 with pool_block=True ensure urllib3 never silently
-    opens secondary connections under contention — this guarantees exactly
-    one TCP connection per (thread, unit) at any given time.
+    opens secondary connections under contention. Across threads, the
+    per-address lock (_get_unit_lock) is what limits the adapter to one
+    connection at a time; callers must hold it while using the session.
     """
     if not hasattr(_tl, "sessions"):
         _tl.sessions = {}
@@ -148,21 +171,34 @@ class PyKumoBase:
         calls will reuse the same TCP connection (keep-alive) until
         end_cycle() is called. Safe to call multiple times; idempotent.
 
+        The cycle holds the adapter's lock until end_cycle(), so commands
+        issued from other threads wait for the cycle to finish instead of
+        opening a second connection to the adapter. begin_cycle() and
+        end_cycle() must be called from the same thread.
+
         Cycle state is stored thread-locally so concurrent threads calling
         into the same PyKumoBase instance each manage their own lifecycle
         independently.
         """
         if not hasattr(_tl, "cycles"):
             _tl.cycles = set()
+        if self._address in _tl.cycles:
+            return
+        _get_unit_lock(self._address).acquire()
         _tl.cycles.add(self._address)
+        getattr(_tl, "failed_cycles", set()).discard(self._address)
 
     def end_cycle(self):
         """Mark the end of a multi-request cycle and close the session.
         Sends a FIN to the adapter, freeing its socket-table entry.
         Safe to call multiple times; idempotent.
         """
-        getattr(_tl, "cycles", set()).discard(self._address)
         _drop_session(self._address)
+        getattr(_tl, "failed_cycles", set()).discard(self._address)
+        cycles = getattr(_tl, "cycles", set())
+        if self._address in cycles:
+            cycles.discard(self._address)
+            _get_unit_lock(self._address).release()
 
     def close(self):
         """Close any open HTTP session to this unit. Alias for end_cycle()
@@ -181,13 +217,31 @@ class PyKumoBase:
           response, sending a clean FIN to the adapter.
 
         Hardening:
+        - At most one request in flight per adapter across all threads
         - Body fully drained before JSON parsing (no abandoned sockets on malformed responses)
         - response.close() in every exit path
         - Session dropped on ANY transport error
         - One retry on transport error with a fresh session
+        - Inside a cycle, once the adapter has failed to answer (timeout or
+          connection error on both attempts), the rest of the cycle's
+          requests fail fast instead of piling more connections onto an
+          adapter that is already struggling
         """
         if not self._address:
             _LOGGER.warning("Unit %s address not set", self._name)
+            return {}
+
+        with _get_unit_lock(self._address):
+            return self._request_locked(post_data)
+
+    def _request_locked(self, post_data):
+        """Body of _request(); caller must hold the adapter's lock."""
+        in_cycle = self._address in getattr(_tl, "cycles", set())
+        if in_cycle and self._address in getattr(_tl, "failed_cycles", set()):
+            _LOGGER.debug(
+                "Skipping request to %s: adapter already failed this cycle",
+                self._address,
+            )
             return {}
 
         url = "http://" + self._address + "/api"
@@ -224,7 +278,7 @@ class PyKumoBase:
 
                 # Close the session if this is a single-shot call
                 # (outside any multi-request cycle).
-                if self._address not in getattr(_tl, "cycles", set()):
+                if not in_cycle:
                     _drop_session(self._address)
 
                 return result
@@ -237,6 +291,7 @@ class PyKumoBase:
                 _drop_session(self._address)
                 if attempt == 1:
                     _LOGGER.warning("Timeout issuing request %s: %s", url, str(ex))
+                    self._mark_cycle_failed(in_cycle)
                     return {}
                 # attempt == 0: fall through to retry with a fresh session
 
@@ -258,9 +313,19 @@ class PyKumoBase:
                 _drop_session(self._address)
                 if attempt == 1:
                     _LOGGER.warning("Error issuing request %s: %s", url, str(ex))
+                    if isinstance(ex, RequestsConnectionError):
+                        self._mark_cycle_failed(in_cycle)
                     return {}
 
         return {}
+
+    def _mark_cycle_failed(self, in_cycle):
+        """Record that the adapter stopped answering during this cycle."""
+        if not in_cycle:
+            return
+        if not hasattr(_tl, "failed_cycles"):
+            _tl.failed_cycles = set()
+        _tl.failed_cycles.add(self._address)
 
     def has_profile(self) -> bool:
         """Return True if the unit profile has been populated from a successful poll.
