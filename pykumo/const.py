@@ -26,6 +26,10 @@ PROFILE_REFRESH_SECONDS = 3600
 # values. Once that's been seen, only ask again after this long.
 MHK2_RECHECK_SECONDS = 600
 
+# Likewise for units without a wireless sensor, whose sensor query comes back
+# with all-null values.
+SENSOR_RECHECK_SECONDS = 600
+
 # How many recent adapter request round-trips get_request_latency() covers.
 # A poll issues three to five requests, so this spans the last few polls.
 REQUEST_LATENCY_SAMPLES = 10

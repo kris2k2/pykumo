@@ -12,14 +12,13 @@ from .const import (
     MHK2_RECHECK_SECONDS,
     POSSIBLE_SENSORS,
     PROFILE_REFRESH_SECONDS,
+    SENSOR_RECHECK_SECONDS,
     SETTABLE_TEMP_SOURCES,
 )
 from .py_kumo_base import PyKumoBase
 
 _LOGGER = logging.getLogger(__name__)
 ALL_FAN_SPEEDS = ["superQuiet", "quiet", "low", "Low", "powerful", "superPowerful"]
-# adapter/status flags that change which modes the unit offers.
-_ADAPTER_MODE_FLAGS = ("autoModePrevention", "userHasModeDry", "userHasModeHeat")
 
 
 def merge(d, v):
@@ -41,6 +40,41 @@ def merge(d, v):
     return d
 
 
+def supported_modes(profile: dict, adapter_status: dict) -> list[str]:
+    """Operating modes a unit offers, named as set_mode() takes them.
+
+    profile is the adapter's indoorUnit/profile and adapter_status its
+    adapter/status. This is the one place the rules live:
+
+    - off and cool: every unit.
+    - dry, heat and vent: when the profile has them. Dry and heat can also be
+      turned off in the app (userHasModeDry, userHasModeHeat); a flag that's
+      missing doesn't turn anything off.
+    - auto: switches between heating and cooling, so it needs heat. The
+      adapter's autoModePrevention turns it off, unless the profile has auto
+      setpoints: some installer configurations set autoModePrevention on
+      units the Comfort app runs in auto.
+    """
+
+    def allowed_in_app(flag):
+        return adapter_status.get(flag) is not False
+
+    modes = ["off", "cool"]
+    if profile.get("hasModeDry") and allowed_in_app("userHasModeDry"):
+        modes.append("dry")
+    heat = bool(profile.get("hasModeHeat")) and allowed_in_app("userHasModeHeat")
+    if heat:
+        modes.append("heat")
+    if profile.get("hasModeVent"):
+        modes.append("vent")
+    auto_setpoints = "auto" in (profile.get("maximumSetPoints") or {}) or (
+        "auto" in (profile.get("minimumSetPoints") or {})
+    )
+    if heat and (not adapter_status.get("autoModePrevention") or auto_setpoints):
+        modes.append("auto")
+    return modes
+
+
 class PyKumo(PyKumoBase):
     """Talk to and control one indoor unit."""
 
@@ -60,13 +94,16 @@ class PyKumo(PyKumoBase):
         self._last_reboot = None
         self._unit_schedule = UnitSchedule(self) if use_schedule else None
         # indoorUnit/profile as last read from the adapter, before the
-        # adapter-status overrides that update_status() applies to _profile.
+        # adapter-status values that update_status() adds to _profile.
         self._raw_profile = None
         self._raw_profile_read_at = None
-        # Last value seen for each of _ADAPTER_MODE_FLAGS in adapter/status.
-        self._adapter_mode_flags = {}
+        # Operating modes the unit offers, from supported_modes(); None until
+        # the profile and adapter status have both been read.
+        self._modes = None
         # When the adapter last reported no MHK2 thermostat attached.
         self._no_mhk2_seen_at = None
+        # When the adapter last reported no wireless sensor.
+        self._no_sensor_seen_at = None
         super().__init__(name, addr, cfg_json, timeouts, serial, min_request_interval)
 
     def _rebootable_response(self, response):
@@ -171,26 +208,6 @@ class PyKumo(PyKumoBase):
             _LOGGER.warning("Exception fetching %s: %s", base_query, str(e))
         return response
 
-    @staticmethod
-    def _compute_has_mode_auto(profile: dict, auto_mode_prevention: bool) -> bool:
-        """True if the unit supports auto (heat/cool) mode.
-
-        Auto switches between heating and cooling, so a unit without heat
-        mode (e.g. a cooling-only PEFY) never has it, whatever else says so.
-        Otherwise honors the adapter's autoModePrevention flag, but falls
-        back to the unit profile's auto setpoints, since some installer
-        configurations set autoModePrevention=True even though the unit (and
-        the Mitsubishi Comfort app) treat auto mode as supported. Checks both
-        maximumSetPoints and minimumSetPoints for an 'auto' key.
-        """
-        if not profile.get("hasModeHeat", False):
-            return False
-        if not auto_mode_prevention:
-            return True
-        max_sp = profile.get("maximumSetPoints", {}) or {}
-        min_sp = profile.get("minimumSetPoints", {}) or {}
-        return "auto" in max_sp or "auto" in min_sp
-
     def update_status(self):
         """Retrieve and cache current status dictionary if enough time
         has passed
@@ -233,34 +250,13 @@ class PyKumo(PyKumoBase):
                     )
                     return False
 
+                # Without a wireless sensor, only look for one now and then.
                 self._sensors = []
-                for s in range(POSSIBLE_SENSORS):
-                    s_str = f"{s}"
-                    query = ["sensors", s_str]
-                    needed = [
-                        "uuid",
-                        "humidity",
-                        "temperature",
-                        "battery",
-                        "rssi",
-                        "txPower",
-                    ]
-
-                    response = self._retrieve_attributes(query, needed)
-
-                    try:
-                        sensor = response["r"]["sensors"][s_str]
-                        if isinstance(sensor, dict) and sensor.get("uuid"):
-                            self._sensors.append(sensor)
-                        else:
-                            # No sensor found at this index; skip the rest
-                            break
-                    except KeyError as ke:
-                        _LOGGER.warning(
-                            f"{self._name}: Error retrieving sensors from {response}: "
-                            f"{str(ke)}"
-                        )
-                        return False
+                if (
+                    self._no_sensor_seen_at is None
+                    or now - self._no_sensor_seen_at > SENSOR_RECHECK_SECONDS
+                ) and not self._update_sensors(now):
+                    return False
 
                 query = ["indoorUnit", "profile"]
                 needed = [
@@ -270,7 +266,6 @@ class PyKumo(PyKumoBase):
                     "hasModeDry",
                     "hasModeHeat",
                     "hasModeVent",
-                    "hasModeAuto",
                     "hasVaneDir",
                     "maximumSetPoints",
                     "minimumSetPoints",
@@ -298,11 +293,8 @@ class PyKumo(PyKumoBase):
                     # so a capability the unit reported earlier isn't lost.
                     raw_profile = {**(self._raw_profile or {}), **raw_profile}
                     self._raw_profile = raw_profile
-                    # Re-read next poll if the adapter only answered in part
-                    # (hasModeAuto never comes from the profile).
-                    complete = all(
-                        key in raw_profile for key in needed if key != "hasModeAuto"
-                    )
+                    # Re-read next poll if the adapter only answered in part.
+                    complete = all(key in raw_profile for key in needed)
                     self._raw_profile_read_at = now if complete else None
                 profile = dict(self._raw_profile)
 
@@ -324,21 +316,7 @@ class PyKumo(PyKumoBase):
                 response = self._retrieve_attributes(query, needed)
                 try:
                     status = response["r"]["adapter"]["status"]
-                    # A flag is missing when the adapter only answered in
-                    # part, which says nothing about it: keep the last value
-                    # seen rather than letting a mode come and go.
-                    for key in _ADAPTER_MODE_FLAGS:
-                        if isinstance(status.get(key), bool):
-                            self._adapter_mode_flags[key] = status[key]
-                    flags = self._adapter_mode_flags
-                    # The user can turn dry and heat off in the app.
-                    if flags.get("userHasModeDry") is False:
-                        profile["hasModeDry"] = False
-                    if flags.get("userHasModeHeat") is False:
-                        profile["hasModeHeat"] = False
-                    profile["hasModeAuto"] = self._compute_has_mode_auto(
-                        profile, flags.get("autoModePrevention", False)
-                    )
+                    modes = supported_modes(profile, status)
                     try:
                         profile["wifiRSSI"] = status["localNetwork"]["stationMode"][
                             "RSSI"
@@ -352,6 +330,7 @@ class PyKumo(PyKumoBase):
                         if isinstance(status.get(key), (int, float)):
                             profile[key] = status[key]
                     self._profile = profile
+                    self._modes = modes
                 except KeyError as ke:
                     _LOGGER.warning(
                         f"{self._name}: Error retrieving adapter profile from {response}: "
@@ -372,6 +351,37 @@ class PyKumo(PyKumoBase):
             return True
         finally:
             self.end_cycle()
+
+    def _update_sensors(self, now):
+        """Query the wireless sensors. Returns False on a bad answer."""
+        for s in range(POSSIBLE_SENSORS):
+            s_str = f"{s}"
+            query = ["sensors", s_str]
+            needed = [
+                "uuid",
+                "humidity",
+                "temperature",
+                "battery",
+                "rssi",
+                "txPower",
+            ]
+
+            response = self._retrieve_attributes(query, needed)
+
+            try:
+                sensor = response["r"]["sensors"][s_str]
+                if isinstance(sensor, dict) and sensor.get("uuid"):
+                    self._sensors.append(sensor)
+                else:
+                    # No sensor found at this index; skip the rest
+                    break
+            except KeyError as ke:
+                _LOGGER.warning(
+                    f"{self._name}: Error retrieving sensors from {response}: {str(ke)}"
+                )
+                return False
+        self._no_sensor_seen_at = None if self._sensors else now
+        return True
 
     def _update_mhk2(self, now):
         """Query the MHK2 thermostat, adding its humidity as a sensor."""
@@ -621,41 +631,27 @@ class PyKumo(PyKumoBase):
             hold_status = f"hold until {dt.strftime('%H:%M')}"
         return hold_status
 
+    def get_supported_modes(self):
+        """Operating modes the unit offers, as set_mode() takes them (see
+        supported_modes()), or None until the unit has been polled.
+        """
+        return None if self._modes is None else list(self._modes)
+
     def has_dry_mode(self):
         """True if unit has dry (dehumidify) mode"""
-        val = None
-        try:
-            val = self._profile["hasModeDry"]
-        except KeyError:
-            val = False
-        return val
+        return "dry" in (self._modes or ())
 
     def has_heat_mode(self):
         """True if unit has heat mode"""
-        val = None
-        try:
-            val = self._profile["hasModeHeat"]
-        except KeyError:
-            val = False
-        return val
+        return "heat" in (self._modes or ())
 
     def has_vent_mode(self):
         """True if unit has vent (fan) mode"""
-        val = None
-        try:
-            val = self._profile["hasModeVent"]
-        except KeyError:
-            val = False
-        return val
+        return "vent" in (self._modes or ())
 
     def has_auto_mode(self):
         """True if unit has auto (heat/cool) mode"""
-        val = None
-        try:
-            val = self._profile["hasModeAuto"]
-        except KeyError:
-            val = False
-        return val
+        return "auto" in (self._modes or ())
 
     def has_vane_direction(self):
         """True if unit supports changing its vane direction (aka swing)"""
@@ -704,11 +700,9 @@ class PyKumo(PyKumoBase):
         elif mode in ("auto", "autoCool", "autoHeat"):
             modes = ["auto"]
         else:
-            modes = ["cool"]
-            if self.has_heat_mode():
-                modes.append("heat")
-            if self.has_auto_mode():
-                modes.append("auto")
+            modes = [
+                m for m in self._modes or ["cool"] if m in ("cool", "heat", "auto")
+            ]
         ranges = [r for r in map(self._profile_setpoint_range, modes) if r]
         if not ranges:
             return None
@@ -718,16 +712,7 @@ class PyKumo(PyKumoBase):
         """Change operation mode. Valid modes: off, cool sometimes also heat,
         dry, vent, auto
         """
-        modes = ["off", "cool"]
-        if self.has_dry_mode():
-            modes.append("dry")
-        if self.has_heat_mode():
-            modes.append("heat")
-        if self.has_vent_mode():
-            modes.append("vent")
-        if self.has_auto_mode():
-            modes.append("auto")
-        if mode not in modes:
+        if mode not in (self._modes or ["off", "cool"]):
             _LOGGER.warning("Attempting to set invalid mode %s", mode)
             return {}
 
