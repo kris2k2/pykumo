@@ -4,12 +4,18 @@ Adapter responses are taken from a traffic capture of a ducted P-series unit
 (PEFY) with no wireless sensor and no MHK2 thermostat.
 """
 
+import copy
 import json
 import unittest
 from unittest.mock import patch
 
 from pykumo import PyKumo
-from pykumo.const import MHK2_RECHECK_SECONDS, PROFILE_REFRESH_SECONDS
+from pykumo.const import (
+    MHK2_RECHECK_SECONDS,
+    PROFILE_REFRESH_SECONDS,
+    SENSOR_RECHECK_SECONDS,
+)
+from pykumo.py_kumo import supported_modes
 
 _CFG = {
     "password": "dGVzdA==",  # base64("test")
@@ -65,7 +71,9 @@ class _FakeAdapter:
 
     def __init__(self, mhk2=_NO_MHK2):
         self.mhk2 = mhk2
-        self.profile = dict(_PROFILE)
+        self.sensor = dict(_NO_SENSOR)
+        self.profile = copy.deepcopy(_PROFILE)
+        self.adapter_status = copy.deepcopy(_ADAPTER_STATUS)
         self.queries = []
         self.failing = set()  # top-level keys to answer with {}
 
@@ -80,10 +88,12 @@ class _FakeAdapter:
             return {"r": {"indoorUnit": {part: dict(body)}}}
         if "sensors" in query:
             self.queries.append("sensors")
-            return {"r": {"sensors": {"0": dict(_NO_SENSOR)}}}
+            index = next(iter(query["sensors"]))
+            sensor = self.sensor if index == "0" else _NO_SENSOR
+            return {"r": {"sensors": {index: dict(sensor)}}}
         if "adapter" in query:
             self.queries.append("adapter")
-            return {"r": {"adapter": {"status": dict(_ADAPTER_STATUS)}}}
+            return {"r": {"adapter": {"status": dict(self.adapter_status)}}}
         if "mhk2" in query:
             self.queries.append("mhk2")
             return {"r": {"mhk2": self.mhk2}}
@@ -114,9 +124,19 @@ class TestPollCycle(unittest.TestCase):
             self.poll(), ["status", "sensors", "profile", "adapter", "mhk2"]
         )
 
-    def test_later_polls_skip_profile_and_absent_mhk2(self):
+    def test_later_polls_skip_profile_and_absent_sensor_and_mhk2(self):
         self.poll()
-        self.assertEqual(self.poll(), ["status", "sensors", "adapter"])
+        self.assertEqual(self.poll(), ["status", "adapter"])
+
+    def test_absent_sensor_rechecked_after_interval(self):
+        self.poll()
+        self.assertIn("sensors", self.poll(advance=SENSOR_RECHECK_SECONDS + 1))
+
+    def test_present_sensor_polled_every_time(self):
+        self.adapter.sensor = {**_NO_SENSOR, "uuid": "abc", "humidity": 52}
+        self.poll()
+        self.assertIn("sensors", self.poll())
+        self.assertEqual(self.unit.get_current_humidity(), 52)
 
     def test_profile_reread_after_refresh_interval(self):
         self.poll()
@@ -143,13 +163,12 @@ class TestPollCycle(unittest.TestCase):
         self.poll()
         self.poll()
         self.assertFalse(self.unit.has_heat_mode())
-        self.assertTrue(self.unit.has_auto_mode())
+        self.assertFalse(self.unit.has_auto_mode())
         self.assertTrue(self.unit.has_dry_mode())
         self.assertEqual(self.unit.get_wifi_rssi(), -42)
         self.assertEqual(self.unit.get_runstate(), "normal")
         # The adapter-status overrides must not leak into the cached profile.
         self.assertNotIn("wifiRSSI", self.unit._raw_profile)
-        self.assertNotIn("hasModeAuto", self.unit._raw_profile)
 
     def test_failed_adapter_status_leaves_profile_alone(self):
         self.poll()
@@ -160,17 +179,107 @@ class TestPollCycle(unittest.TestCase):
         self.assertEqual(self.unit._profile, before)
 
 
+class TestModes(unittest.TestCase):
+    """Which modes update_status() finds the unit offers."""
+
+    def setUp(self):
+        self.adapter = _FakeAdapter()
+        self.unit = PyKumo("Apartment", "192.0.2.1", _CFG)
+        patcher = patch.object(PyKumo, "_request", side_effect=self.adapter.request)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.now = 1000.0
+        clock = patch("pykumo.py_kumo.time.monotonic", side_effect=lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def poll(self, advance=60):
+        self.now += advance
+        self.assertTrue(self.unit.update_status())
+        return self.modes()
+
+    def modes(self):
+        checks = {
+            "dry": self.unit.has_dry_mode,
+            "heat": self.unit.has_heat_mode,
+            "vent": self.unit.has_vent_mode,
+            "auto": self.unit.has_auto_mode,
+        }
+        return {mode for mode, check in checks.items() if check()}
+
+    def heat_pump(self):
+        self.adapter.profile["hasModeHeat"] = True
+        self.adapter.adapter_status["userHasModeHeat"] = True
+
+    def test_cooling_only_unit(self):
+        # The PEFY's profile has auto setpoints, but with no heat mode there
+        # is nothing for auto to switch to.
+        self.assertEqual(self.poll(), {"dry", "vent"})
+        self.assertEqual(
+            self.unit.get_supported_modes(), ["off", "cool", "dry", "vent"]
+        )
+        with patch.object(PyKumo, "_request") as request:
+            self.assertEqual(self.unit.set_mode("auto"), {})
+            self.assertEqual(self.unit.set_mode("heat"), {})
+        request.assert_not_called()
+
+    def test_cooling_only_unit_without_auto_prevention(self):
+        self.adapter.adapter_status["autoModePrevention"] = False
+        self.assertNotIn("auto", self.poll())
+
+    def test_heat_pump_with_auto_setpoints(self):
+        self.heat_pump()
+        self.assertEqual(self.poll(), {"dry", "heat", "vent", "auto"})
+
+    def test_heat_pump_with_auto_prevented(self):
+        self.heat_pump()
+        for profile_key in ("maximumSetPoints", "minimumSetPoints"):
+            del self.adapter.profile[profile_key]["auto"]
+        self.assertNotIn("auto", self.poll())
+
+    def test_heat_turned_off_in_app_also_turns_off_auto(self):
+        self.heat_pump()
+        self.adapter.adapter_status["userHasModeHeat"] = False
+        self.assertEqual(self.poll(), {"dry", "vent"})
+
+    def test_dry_turned_off_in_app(self):
+        self.adapter.adapter_status["userHasModeDry"] = False
+        self.assertEqual(self.poll(), {"vent"})
+
+    def test_missing_flags_turn_nothing_off(self):
+        self.heat_pump()
+        for key in ("userHasModeDry", "userHasModeHeat", "autoModePrevention"):
+            del self.adapter.adapter_status[key]
+        self.assertEqual(self.poll(), {"dry", "heat", "vent", "auto"})
+
+    def test_unknown_before_first_poll(self):
+        self.assertIsNone(self.unit.get_supported_modes())
+        self.assertEqual(self.modes(), set())
+
+    def test_failed_poll_keeps_modes(self):
+        self.poll()
+        self.adapter.failing = {"adapter"}
+        self.now += 60
+        self.assertFalse(self.unit.update_status())
+        self.assertEqual(self.modes(), {"dry", "vent"})
+
+    def test_partial_profile_reread_keeps_dry(self):
+        self.assertIn("dry", self.poll())
+        del self.adapter.profile["hasModeDry"]
+        self.assertIn("dry", self.poll(advance=PROFILE_REFRESH_SECONDS + 1))
+
+
 def _unit_with_profile(**overrides):
     unit = PyKumo("Unit", "192.0.2.1", _CFG)
     profile = {
         **_PROFILE,
         "hasModeHeat": True,
-        "hasModeAuto": True,
         "userMinCoolSetPoint": 19.5,
         "userMaxHeatSetPoint": 26,
     }
     profile.update(overrides)
     unit._profile = profile
+    unit._modes = supported_modes(profile, {})
     return unit
 
 
@@ -195,7 +304,7 @@ class TestSetpointLimits(unittest.TestCase):
     def test_off_spans_supported_modes(self):
         unit = _unit_with_profile()
         self.assertEqual(unit.get_setpoint_limits("off"), (17, 30))
-        unit = _unit_with_profile(hasModeHeat=False, hasModeAuto=False)
+        unit = _unit_with_profile(hasModeHeat=False)
         self.assertEqual(unit.get_setpoint_limits("vent"), (19.5, 30))
 
     def test_user_limits_only_narrow(self):
