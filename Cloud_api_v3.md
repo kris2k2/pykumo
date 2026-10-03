@@ -22,6 +22,16 @@ Portions of the v3 API are not yet documented:
 ## WebSocket interface
 More information -- including the indoor unit password -- is available via a WebSocket interface. [HA-Kumo-WS](https://github.com/EnumC/ha_kumo_ws) is an entirely cloud-based integration and has examples of using this WebSocket.
 
+### Observed in an October 2026 capture
+A traffic capture (pykumo 0.5.3, app version `3.2.4`, adapter firmware `02.06.26`) showed:
+
+- **No credentials from the cloud.** `/v3/devices/{serial}/status` no longer included `cryptoSerial` (or `cryptoKeySet`), and the `adapter_update` sent in reply to `force_adapter_request` had no `password`. Local control kept working only because credentials were cached from an earlier setup. The adapter's own `adapter/status` still includes its password, but you need the password to ask for it.
+- **Handshake timing.** `socket-prod.kumocloud.com` uses Engine.IO 4 over long polling with `pingInterval` 25000 and `pingTimeout` 20000. With nothing else to send, a poll stays open until the next ping, about 25 s, so the poll's read timeout must be longer than that.
+- **Event sequence.** `subscribe ["", <user-id>]` gets `subscribed`; `subscribe [<serial>]` gets an immediate full `device_update`; `force_adapter_request [<serial>, "adapterStatus"]` gets an `adapter_update` about a second later; `device_status_v2 [<serial>]` gets connection details (`status`, `lastTimeConnected`, `lastDisconnectedReason`, `serverId`, `hasIduCommunicationError`). `device_status_v2 [""]` gets back an empty `{"deviceSerial": ""}`.
+- **`adapter_update` fields:** `firmwareVersion`, `roomTempDisplayOffset`, `routerSsid`, `routerRssi`, `minSetpoint`/`maxSetpoint` (also spelled `minSetPoint`/`maxSetPoint`), `lastUpdated`.
+- **`device_update` fields** match `devices/{device-serial}` below, plus `realValues`, `collectMethod` and `date`. A partial `device_update` (only the changed operating values) follows each `device_status_v2`.
+- **Setpoint limits.** The status endpoint's `minSetPoint`/`maxSetPoint` (19.5/28 here) match the local `adapter/status` fields `userMinCoolSetPoint`/`userMaxHeatSetPoint`: limits set in the app, which can be narrower than the profile's `minimumSetPoints`/`maximumSetPoints` (cool 19-30, heat 17-28, auto 19-28 on the same unit). pykumo's `get_setpoint_limits()` combines the two.
+
 ## Hostname
 The scheme and hostname for all endpoints described below is https://app-prod.kumocloud.com/
 
@@ -400,7 +410,7 @@ These endpoints return information per device (indoor unit).
 `{device-serial}` is the `adapter.deviceSerial` field returned by the `/v3/sites/{site-id}/zones` endpoint.
 These endpoints return operational data for each indoor unit similar to that returned by the local API.
 
-Importantly, the `status` endpoint returns the `cryptoSerial` value, required for local communication with the indoor unit.
+Importantly, the `status` endpoint returns the `cryptoSerial` value, required for local communication with the indoor unit. (As of October 2026 it no longer does; see [WebSocket interface](#websocket-interface).)
 
 ### devices/{device-serial}
 ```

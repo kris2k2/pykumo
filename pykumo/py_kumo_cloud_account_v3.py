@@ -233,7 +233,11 @@ class KumoCloudV3:
     def get_passwords_via_websocket(
         self, device_serials: list, timeout_secs: int = 30
     ) -> dict:
-        """Connect to Socket.IO and collect adapter_update events with passwords."""
+        """Connect to Socket.IO and collect adapter_update events with passwords.
+
+        Returns once every device has sent an adapter_update, whether or not
+        it carried a password, or after timeout_secs.
+        """
         if not self._access_token:
             return {}
 
@@ -297,10 +301,17 @@ class KumoCloudV3:
             return passwords
 
         try:
-            sid = json.loads(resp.text[1:]).get("sid")
+            handshake = json.loads(resp.text[1:])
+            sid = handshake.get("sid")
         except json.JSONDecodeError:
             _LOGGER.warning("Socket.IO handshake parse error")
             return passwords
+        # The server pings every pingInterval ms, so a long poll can take
+        # that long to answer when nothing else happens; wait a bit longer.
+        try:
+            long_poll_timeout = float(handshake.get("pingInterval")) / 1000 + 5
+        except (TypeError, ValueError):
+            long_poll_timeout = 30
 
         _LOGGER.debug("Socket.IO connected, sid=%s", sid)
         poll_params = {**base_params, "sid": sid}
@@ -382,10 +393,15 @@ class KumoCloudV3:
         )
         _post("\x1e".join(status_msgs))
 
-        # 7. Poll for adapter_update events
+        # 7. Poll for adapter_update events. The cloud may leave the password
+        # out of the reply to force_adapter_request, and asking again won't
+        # change that, so stop waiting for a device once it has answered.
+        answered = set()
         deadline = time.monotonic() + timeout_secs
         poll_count = 0
-        while time.monotonic() < deadline and serials_needed - set(passwords.keys()):
+        while time.monotonic() < deadline:
+            if not serials_needed - answered - set(passwords):
+                break
             if self._cancel_event.is_set():
                 break
 
@@ -395,7 +411,7 @@ class KumoCloudV3:
 
             poll_count += 1
             try:
-                resp = _poll(timeout=min(25, remaining + 1))
+                resp = _poll(timeout=min(long_poll_timeout, remaining + 1))
             except Timeout:
                 continue
             except Exception:
@@ -404,7 +420,7 @@ class KumoCloudV3:
             if not resp.ok:
                 break
 
-            self._extract_passwords(resp.text, passwords, serials_needed)
+            self._extract_passwords(resp.text, passwords, serials_needed, answered)
 
             # Respond to ping with pong
             if EIO_PING in self._split_messages(resp.text):
@@ -419,6 +435,11 @@ class KumoCloudV3:
             len(serials_needed),
             poll_count,
         )
+        for serial in sorted(answered - set(passwords)):
+            _LOGGER.info(
+                "Kumo Cloud sent adapter status for %s without its password",
+                serial,
+            )
         return passwords
 
     @staticmethod
@@ -428,8 +449,14 @@ class KumoCloudV3:
             return []
         return raw.split("\x1e") if "\x1e" in raw else [raw]
 
-    def _extract_passwords(self, raw: str, passwords: dict, serials_needed: set):
-        """Parse Socket.IO messages for adapter_update events with passwords."""
+    def _extract_passwords(
+        self, raw: str, passwords: dict, serials_needed: set, answered=None
+    ):
+        """Parse Socket.IO messages for adapter_update events with passwords.
+
+        Serials whose adapter_update arrived, with or without a password, are
+        added to answered if given.
+        """
         for msg in self._split_messages(raw):
             # Strip Engine.IO length prefix if present
             if ":" in msg and msg.split(":")[0].isdigit():
@@ -451,6 +478,8 @@ class KumoCloudV3:
             ):
                 serial = payload[1].get("deviceSerial", "")
                 password = payload[1].get("password", "")
+                if serial in serials_needed and answered is not None:
+                    answered.add(serial)
                 if serial in serials_needed and password:
                     passwords[serial] = password
                     _LOGGER.info("Got password for %s via adapter_update", serial)

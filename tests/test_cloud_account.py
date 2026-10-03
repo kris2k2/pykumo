@@ -320,6 +320,31 @@ class TestKumoCloudAccount(unittest.TestCase):
 
     @patch("pykumo.py_kumo_cloud_account.KumoCloudV3")
     @patch("pykumo.py_kumo_cloud_account.probe_ip")
+    def test_cloud_without_credentials_uses_cache(self, mock_probe_ip, mock_v3):
+        """The cloud lists units but no longer sends their credentials:
+        cached ones fill in, and units with none at all are reported."""
+        mock_probe_ip.return_value = True
+        no_creds = {"password": "", "cryptoSerial": "", "unitType": "ductless"}
+        mock_v3.return_value.get_all_device_credentials.return_value = {
+            "SERIAL1": {"serial": "SERIAL1", "label": "Unit 1", **no_creds},
+            "SERIAL2": {"serial": "SERIAL2", "label": "Unit 2", **no_creds},
+        }
+
+        account = KumoCloudAccount(
+            self.username, self.password, kumo_dict=self.cached_dict
+        )
+        with self.assertLogs("pykumo.py_kumo_cloud_account", "WARNING") as logs:
+            success = account.try_setup()
+
+        self.assertTrue(success)
+        self.assertEqual(list(account._units), ["SERIAL1"])
+        self.assertEqual(account.get_credentials("SERIAL1")["password"], "pw1")
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("SERIAL2", logs.output[0])
+        self.assertIn("password or cryptoSerial", logs.output[0])
+
+    @patch("pykumo.py_kumo_cloud_account.KumoCloudV3")
+    @patch("pykumo.py_kumo_cloud_account.probe_ip")
     def test_prefer_cache_skips_cloud(self, mock_probe_ip, mock_v3):
         """Test that prefer_cache=True skips the V3 cloud call when cache is present."""
         mock_probe_ip.return_value = True

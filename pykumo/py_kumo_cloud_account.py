@@ -191,6 +191,17 @@ class KumoCloudAccount:
                 # We keep the unit in _units even if address is missing,
                 # though PyKumo will fail to connect. This preserves HA entities.
                 self._units[serial] = self._parse_unit(unit_data)
+            else:
+                missing = [
+                    f for f in ("password", "cryptoSerial") if not unit_data.get(f)
+                ]
+                _LOGGER.warning(
+                    "Skipping unit %s (%s): Kumo Cloud didn't provide its %s, "
+                    "and none is cached from an earlier setup",
+                    serial,
+                    unit_data.get("label", ""),
+                    " or ".join(missing),
+                )
 
         # Update kumo_dict for future caching
         # We wrap it in the expected v2-like structure for HA compatibility

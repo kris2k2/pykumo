@@ -7,7 +7,13 @@ from collections.abc import MutableMapping
 
 from .schedule import UnitSchedule
 
-from .const import CACHE_INTERVAL_SECONDS, POSSIBLE_SENSORS, SETTABLE_TEMP_SOURCES
+from .const import (
+    CACHE_INTERVAL_SECONDS,
+    MHK2_RECHECK_SECONDS,
+    POSSIBLE_SENSORS,
+    PROFILE_REFRESH_SECONDS,
+    SETTABLE_TEMP_SOURCES,
+)
 from .py_kumo_base import PyKumoBase
 
 _LOGGER = logging.getLogger(__name__)
@@ -51,6 +57,12 @@ class PyKumo(PyKumoBase):
         """Constructor"""
         self._last_reboot = None
         self._unit_schedule = UnitSchedule(self) if use_schedule else None
+        # indoorUnit/profile as last read from the adapter, before the
+        # adapter-status overrides that update_status() applies to _profile.
+        self._raw_profile = None
+        self._raw_profile_read_at = None
+        # When the adapter last reported no MHK2 thermostat attached.
+        self._no_mhk2_seen_at = None
         super().__init__(name, addr, cfg_json, timeouts, serial, min_request_interval)
 
     def _rebootable_response(self, response):
@@ -155,7 +167,8 @@ class PyKumo(PyKumoBase):
             _LOGGER.warning("Exception fetching %s: %s", base_query, str(e))
         return response
 
-    def _compute_has_mode_auto(self, auto_mode_prevention: bool) -> bool:
+    @staticmethod
+    def _compute_has_mode_auto(profile: dict, auto_mode_prevention: bool) -> bool:
         """True if the unit supports auto (heat/cool) mode.
 
         Honors the adapter's autoModePrevention flag, but falls back to the
@@ -166,8 +179,8 @@ class PyKumo(PyKumoBase):
         """
         if not auto_mode_prevention:
             return True
-        max_sp = self._profile.get("maximumSetPoints", {}) or {}
-        min_sp = self._profile.get("minimumSetPoints", {}) or {}
+        max_sp = profile.get("maximumSetPoints", {}) or {}
+        min_sp = profile.get("minimumSetPoints", {}) or {}
         return "auto" in max_sp or "auto" in min_sp
 
     def update_status(self):
@@ -257,15 +270,30 @@ class PyKumo(PyKumoBase):
                 # Following not currently used
                 # 'extendedTemps', 'usesSetPointInDryMode', 'hasHotAdjust', 'hasDefrost',
                 # 'hasStandby'
-                response = self._retrieve_attributes(query, needed)
-                try:
-                    self._profile = response["r"]["indoorUnit"]["profile"]
-                except KeyError as ke:
-                    _LOGGER.warning(
-                        f"{self._name}: Error retrieving profile from {response}: "
-                        f"{str(ke)}"
+                # The profile is static, so it's only re-read now and then.
+                if (
+                    self._raw_profile_read_at is None
+                    or now - self._raw_profile_read_at > PROFILE_REFRESH_SECONDS
+                ):
+                    response = self._retrieve_attributes(query, needed)
+                    try:
+                        raw_profile = response["r"]["indoorUnit"]["profile"]
+                        if not isinstance(raw_profile, dict):
+                            raise KeyError("profile")
+                    except (KeyError, TypeError) as ke:
+                        _LOGGER.warning(
+                            f"{self._name}: Error retrieving profile from {response}: "
+                            f"{str(ke)}"
+                        )
+                        return False
+                    self._raw_profile = raw_profile
+                    # Re-read next poll if the adapter only answered in part
+                    # (hasModeAuto never comes from the profile).
+                    complete = all(
+                        key in raw_profile for key in needed if key != "hasModeAuto"
                     )
-                    return False
+                    self._raw_profile_read_at = now if complete else None
+                profile = dict(self._raw_profile)
 
                 # Edit profile with settings from adapter
                 query = ["adapter", "status"]
@@ -277,27 +305,34 @@ class PyKumo(PyKumoBase):
                     "runState",
                 ]
                 # Following not currently used:
-                # 'name', 'roomTempOffset', 'userMinCoolSetPoint', 'userMaxHeatSetPoint',
-                # 'ledDisabled', 'serverHostname'
+                # 'name', 'roomTempOffset', 'ledDisabled', 'serverHostname'
+                # ('userMinCoolSetPoint' and 'userMaxHeatSetPoint' are used when
+                # present but aren't requested individually on a fallback)
                 # ['adapter', 'info'] not used:
                 # ['macAddress', 'serialNumber', 'isTestMode', 'firmwareVersion']
                 response = self._retrieve_attributes(query, needed)
                 try:
                     status = response["r"]["adapter"]["status"]
-                    self._profile["hasModeAuto"] = self._compute_has_mode_auto(
-                        status.get("autoModePrevention", False)
+                    profile["hasModeAuto"] = self._compute_has_mode_auto(
+                        profile, status.get("autoModePrevention", False)
                     )
                     if not status.get("userHasModeDry", False):
-                        self._profile["hasModeDry"] = False
+                        profile["hasModeDry"] = False
                     if not status.get("userHasModeHeat", False):
-                        self._profile["hasModeHeat"] = False
+                        profile["hasModeHeat"] = False
                     try:
-                        self._profile["wifiRSSI"] = status["localNetwork"][
-                            "stationMode"
-                        ]["RSSI"]
+                        profile["wifiRSSI"] = status["localNetwork"]["stationMode"][
+                            "RSSI"
+                        ]
                     except KeyError:
-                        self._profile["wifiRSSI"] = None
-                    self._profile["runState"] = status.get("runState", "unknown")
+                        profile["wifiRSSI"] = None
+                    profile["runState"] = status.get("runState", "unknown")
+                    # Setpoint limits the user set in the app, which can be
+                    # narrower than what the unit itself allows.
+                    for key in ("userMinCoolSetPoint", "userMaxHeatSetPoint"):
+                        if isinstance(status.get(key), (int, float)):
+                            profile[key] = status[key]
+                    self._profile = profile
                 except KeyError as ke:
                     _LOGGER.warning(
                         f"{self._name}: Error retrieving adapter profile from {response}: "
@@ -306,30 +341,11 @@ class PyKumo(PyKumoBase):
                     return False
 
                 # Edit profile with data from MHK2 if present
-                query = '{"c":{"mhk2":{"status":{}}}}'.encode("utf-8")
-                response = self._request(query)
-                try:
-                    self._mhk2 = response["r"]["mhk2"]
-                    if isinstance(self._mhk2, dict):
-                        mhk2_humidity = self._mhk2["status"]["indoorHumid"]
-
-                        if mhk2_humidity is not None:
-                            # Add a sensor entry for the MHK2 unit.
-                            mhk2_sensor_value = {
-                                "battery": None,
-                                "humidity": mhk2_humidity,
-                                "rssi": None,
-                                "temperature": None,
-                                "txPower": None,
-                                "uuid": None,
-                            }
-                            self._sensors.append(mhk2_sensor_value)
-                except (KeyError, TypeError) as e:
-                    # We don't bailout here since the MHK2 component is optional.
-                    _LOGGER.info(
-                        f"{self._name}: Error retrieving MHK2 status from {response}: {e}"
-                    )
-                    pass
+                if (
+                    self._no_mhk2_seen_at is None
+                    or now - self._no_mhk2_seen_at > MHK2_RECHECK_SECONDS
+                ):
+                    self._update_mhk2(now)
 
             if self._unit_schedule is not None:
                 self._unit_schedule.fetch()
@@ -337,6 +353,38 @@ class PyKumo(PyKumoBase):
             return True
         finally:
             self.end_cycle()
+
+    def _update_mhk2(self, now):
+        """Query the MHK2 thermostat, adding its humidity as a sensor."""
+        query = '{"c":{"mhk2":{"status":{}}}}'.encode("utf-8")
+        response = self._request(query)
+        try:
+            self._mhk2 = response["r"]["mhk2"]
+        except (KeyError, TypeError) as e:
+            # We don't bailout here since the MHK2 component is optional.
+            _LOGGER.info(
+                f"{self._name}: Error retrieving MHK2 status from {response}: {e}"
+            )
+            return
+
+        status = self._mhk2.get("status") if isinstance(self._mhk2, dict) else None
+        if not isinstance(status, dict) or all(v is None for v in status.values()):
+            self._no_mhk2_seen_at = now
+            return
+        self._no_mhk2_seen_at = None
+
+        mhk2_humidity = status.get("indoorHumid")
+        if mhk2_humidity is not None:
+            # Add a sensor entry for the MHK2 unit.
+            mhk2_sensor_value = {
+                "battery": None,
+                "humidity": mhk2_humidity,
+                "rssi": None,
+                "temperature": None,
+                "txPower": None,
+                "uuid": None,
+            }
+            self._sensors.append(mhk2_sensor_value)
 
     def get_mode(self):
         """Last retrieved operating mode from unit"""
@@ -598,6 +646,54 @@ class PyKumo(PyKumoBase):
         except KeyError:
             val = False
         return val
+
+    def _profile_setpoint_range(self, profile_mode):
+        """(min, max) °C the unit profile allows in 'cool', 'heat' or 'auto',
+        narrowed by the user's limits from the app; None if unknown.
+        """
+        lo = (self._profile.get("minimumSetPoints") or {}).get(profile_mode)
+        hi = (self._profile.get("maximumSetPoints") or {}).get(profile_mode)
+        if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)):
+            return None
+        # The app's limits apply to the cooling and heating setpoints. In auto
+        # they bound the inside of the range (spCool's floor, spHeat's
+        # ceiling) rather than its ends, so they don't narrow it.
+        user_min_cool = self._profile.get("userMinCoolSetPoint")
+        user_max_heat = self._profile.get("userMaxHeatSetPoint")
+        if profile_mode == "cool" and isinstance(user_min_cool, (int, float)):
+            lo = max(lo, user_min_cool)
+        if profile_mode == "heat" and isinstance(user_max_heat, (int, float)):
+            hi = min(hi, user_max_heat)
+        if lo > hi:
+            return None
+        return (lo, hi)
+
+    def get_setpoint_limits(self, mode=None):
+        """Lowest and highest setpoint, in °C, the unit accepts in mode.
+
+        mode is a unit operating mode as returned by get_mode(); it defaults
+        to the current one. For modes without a setpoint of their own (off,
+        vent), the limits span every setpoint mode the unit supports.
+        Returns (min, max), or None until the profile has been read.
+        """
+        if mode is None:
+            mode = self.get_mode()
+        if mode in ("cool", "dry"):
+            modes = ["cool"]
+        elif mode == "heat":
+            modes = ["heat"]
+        elif mode in ("auto", "autoCool", "autoHeat"):
+            modes = ["auto"]
+        else:
+            modes = ["cool"]
+            if self.has_heat_mode():
+                modes.append("heat")
+            if self.has_auto_mode():
+                modes.append("auto")
+        ranges = [r for r in map(self._profile_setpoint_range, modes) if r]
+        if not ranges:
+            return None
+        return (min(r[0] for r in ranges), max(r[1] for r in ranges))
 
     def set_mode(self, mode):
         """Change operation mode. Valid modes: off, cool sometimes also heat,
