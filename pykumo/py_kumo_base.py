@@ -12,6 +12,7 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout
 from urllib3.util import SKIP_HEADER
+from . import traffic
 from .const import (
     CACHE_INTERVAL_SECONDS,
     W_PARAM,
@@ -362,6 +363,15 @@ class PyKumoBase:
                 _LOGGER.debug(
                     "Issue request %s %s (attempt %d)", url, post_data, attempt
                 )
+                traffic.log_event(
+                    "local",
+                    "send",
+                    unit=self._name,
+                    address=self._address,
+                    attempt=attempt,
+                    body=traffic.decode_body(post_data),
+                )
+                started = time.monotonic()
                 response = session.put(
                     url,
                     headers=headers,
@@ -374,6 +384,16 @@ class PyKumoBase:
                 # body is already fully read so urllib3 can return the
                 # connection to the pool cleanly rather than abandoning it.
                 content = response.content
+                traffic.log_event(
+                    "local",
+                    "recv",
+                    unit=self._name,
+                    address=self._address,
+                    attempt=attempt,
+                    status=response.status_code,
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                    body=traffic.decode_body(content),
+                )
                 response.close()
                 response = None
 
@@ -388,6 +408,14 @@ class PyKumoBase:
 
             except Timeout as ex:
                 _LOGGER.debug("Timeout on attempt %d for %s: %s", attempt, url, str(ex))
+                traffic.log_event(
+                    "local",
+                    "error",
+                    unit=self._name,
+                    address=self._address,
+                    attempt=attempt,
+                    error=f"{type(ex).__name__}: {ex}",
+                )
                 self._cleanup_response(response)
                 # A timeout means the connection state is unknowable —
                 # drop it rather than risk reusing a half-dead socket.
@@ -411,6 +439,14 @@ class PyKumoBase:
                     url,
                     str(ex),
                     type(ex).__name__,
+                )
+                traffic.log_event(
+                    "local",
+                    "error",
+                    unit=self._name,
+                    address=self._address,
+                    attempt=attempt,
+                    error=f"{type(ex).__name__}: {ex}",
                 )
                 self._cleanup_response(response)
                 _drop_session(self._address)

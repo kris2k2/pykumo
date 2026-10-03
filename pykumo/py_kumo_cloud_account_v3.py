@@ -20,6 +20,8 @@ from typing import Optional
 import requests
 from requests.exceptions import Timeout
 
+from . import traffic
+
 _LOGGER = logging.getLogger(__name__)
 
 V3_BASE_URL = "https://app-prod.kumocloud.com"
@@ -40,6 +42,48 @@ EIO_PONG = "3"
 SIO_CONNECT = "40"
 SIO_EVENT = "42"
 SIO_CONNECT_ERROR = "44"
+
+
+def _elapsed_ms(resp):
+    elapsed = getattr(resp, "elapsed", None)
+    return round(elapsed.total_seconds() * 1000) if elapsed is not None else None
+
+
+def _log_http(method: str, path: str, request_body=None, resp=None, error=None):
+    """Report one cloud REST exchange to the traffic log."""
+    if not traffic.is_enabled():
+        return
+    traffic.log_event("cloud", "send", method=method, path=path, body=request_body)
+    if error is not None:
+        traffic.log_event(
+            "cloud",
+            "error",
+            method=method,
+            path=path,
+            error=f"{type(error).__name__}: {error}",
+        )
+    elif resp is not None:
+        traffic.log_event(
+            "cloud",
+            "recv",
+            method=method,
+            path=path,
+            status=resp.status_code,
+            elapsed_ms=_elapsed_ms(resp),
+            body=traffic.decode_body(resp.text),
+        )
+
+
+def _log_socketio(direction: str, raw, **fields):
+    """Report Socket.IO frames sent or received to the traffic log."""
+    if not traffic.is_enabled():
+        return
+    traffic.log_event(
+        "socketio",
+        direction,
+        packets=traffic.decode_socketio_payload(raw),
+        **fields,
+    )
 
 
 class KumoCloudV3:
@@ -69,8 +113,10 @@ class KumoCloudV3:
                 timeout=V3_CLOUD_TIMEOUT,
             )
         except Exception as ex:
+            _log_http("POST", "/v3/login", body, error=ex)
             _LOGGER.warning("V3 login error: %s", ex)
             return False
+        _log_http("POST", "/v3/login", body, resp=resp)
 
         if not resp.ok:
             _LOGGER.warning("V3 login failed: %s %s", resp.status_code, resp.text[:200])
@@ -101,8 +147,10 @@ class KumoCloudV3:
                 timeout=V3_CLOUD_TIMEOUT,
             )
         except Exception as ex:
+            _log_http("POST", "/v3/refresh", {"refresh": self._refresh_token}, error=ex)
             _LOGGER.warning("V3 token refresh error: %s", ex)
             return False
+        _log_http("POST", "/v3/refresh", {"refresh": self._refresh_token}, resp=resp)
 
         if not resp.ok:
             return False
@@ -140,8 +188,10 @@ class KumoCloudV3:
                 url, headers=self._auth_headers(), timeout=V3_CLOUD_TIMEOUT
             )
         except Exception as ex:
+            _log_http("GET", path, error=ex)
             _LOGGER.warning("V3 GET %s error: %s", path, ex)
             return None
+        _log_http("GET", path, resp=resp)
 
         if resp.status_code == 401 and self.refresh():
             try:
@@ -149,8 +199,10 @@ class KumoCloudV3:
                     url, headers=self._auth_headers(), timeout=V3_CLOUD_TIMEOUT
                 )
             except Exception as ex:
+                _log_http("GET", path, error=ex)
                 _LOGGER.warning("V3 GET %s error after refresh: %s", path, ex)
                 return None
+            _log_http("GET", path, resp=resp)
 
         if not resp.ok:
             _LOGGER.warning("V3 GET %s: HTTP %s", path, resp.status_code)
@@ -230,8 +282,15 @@ class KumoCloudV3:
                 timeout=15,
             )
         except Exception as ex:
+            traffic.log_event(
+                "socketio",
+                "error",
+                stage="handshake",
+                error=f"{type(ex).__name__}: {ex}",
+            )
             _LOGGER.warning("Socket.IO handshake failed: %s", ex)
             return passwords
+        _log_socketio("recv", resp.text, stage="handshake", status=resp.status_code)
 
         if not resp.ok or not resp.text.startswith("0"):
             _LOGGER.warning("Socket.IO handshake unexpected: %s", resp.text[:200])
@@ -248,6 +307,7 @@ class KumoCloudV3:
         post_headers = {**headers, "Content-Type": "text/plain;charset=UTF-8"}
 
         def _post(data):
+            _log_socketio("send", data, sid=sid)
             session.post(
                 f"{SOCKET_URL}/socket.io/",
                 params=poll_params,
@@ -257,12 +317,23 @@ class KumoCloudV3:
             )
 
         def _poll(timeout=10):
-            return session.get(
-                f"{SOCKET_URL}/socket.io/",
-                params=poll_params,
-                headers=headers,
-                timeout=timeout,
-            )
+            try:
+                resp = session.get(
+                    f"{SOCKET_URL}/socket.io/",
+                    params=poll_params,
+                    headers=headers,
+                    timeout=timeout,
+                )
+            except Exception as ex:
+                traffic.log_event(
+                    "socketio",
+                    "error",
+                    sid=sid,
+                    error=f"{type(ex).__name__}: {ex}",
+                )
+                raise
+            _log_socketio("recv", resp.text, sid=sid, status=resp.status_code)
+            return resp
 
         # 2. Namespace connect
         _post(SIO_CONNECT)
