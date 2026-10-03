@@ -10,6 +10,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout
+from urllib3.util import SKIP_HEADER
 from .const import (
     CACHE_INTERVAL_SECONDS,
     W_PARAM,
@@ -76,6 +77,10 @@ def _get_session(address: str) -> requests.Session:
             pool_block=True,  # serialize rather than opening a second conn
         )
         session.mount("http://", adapter)
+        # Don't send a User-Agent: the adapter doesn't need one and it only
+        # adds bytes to every request. Setting it to None isn't enough, as
+        # urllib3 then adds its own default; SKIP_HEADER suppresses both.
+        session.headers["User-Agent"] = SKIP_HEADER
         _tl.sessions[address] = session
 
     return session

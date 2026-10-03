@@ -71,6 +71,7 @@ class _FakeAdapter:
         self.open = 0
         self.max_open = 0
         self.requests = 0
+        self.last_headers = None
         self.hang = False
         self.delay = 0.02
         adapter = self
@@ -98,6 +99,7 @@ class _FakeAdapter:
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 with adapter.lock:
                     adapter.requests += 1
+                    adapter.last_headers = self.headers
                 if adapter.hang:
                     time.sleep(1.0)
                     return
@@ -170,6 +172,13 @@ class TestConnectionHandling(unittest.TestCase):
         before = self.adapter.requests
         self.assertTrue(unit.set_mode("cool"))
         self.assertEqual(self.adapter.requests, before + 1)
+
+    def test_no_user_agent_header(self):
+        """Requests carry no User-Agent but still advertise Accept-Encoding."""
+        unit = self._make_unit()
+        unit.set_mode("cool")
+        self.assertNotIn("User-Agent", self.adapter.last_headers)
+        self.assertIn("Accept-Encoding", self.adapter.last_headers)
 
     def test_cycle_releases_adapter_lock(self):
         """begin_cycle() is idempotent and end_cycle() frees the adapter."""
