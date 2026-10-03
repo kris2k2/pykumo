@@ -13,7 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pykumo import PyKumo
-from pykumo.py_kumo_base import _get_unit_lock
+from pykumo.const import UNIT_MIN_REQUEST_INTERVAL_SECONDS
+from pykumo.py_kumo_base import _get_adapter_gate
 
 _CFG = {
     "password": "dGVzdA==",  # base64("test")
@@ -72,6 +73,7 @@ class _FakeAdapter:
         self.max_open = 0
         self.requests = 0
         self.last_headers = None
+        self.arrivals = []  # (monotonic time, request body) per request
         self.hang = False
         self.delay = 0.02
         adapter = self
@@ -96,10 +98,11 @@ class _FakeAdapter:
                 pass
 
             def do_PUT(self):
-                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 with adapter.lock:
                     adapter.requests += 1
                     adapter.last_headers = self.headers
+                    adapter.arrivals.append((time.monotonic(), body))
                 if adapter.hang:
                     time.sleep(1.0)
                     return
@@ -128,8 +131,14 @@ class TestConnectionHandling(unittest.TestCase):
         self.adapter = _FakeAdapter()
         self.addCleanup(self.adapter.close)
 
-    def _make_unit(self, timeouts=(1.0, 1.0)):
-        return PyKumo("Test Unit", self.adapter.address, _CFG, timeouts=timeouts)
+    def _make_unit(self, timeouts=(1.0, 1.0), min_request_interval=0):
+        return PyKumo(
+            "Test Unit",
+            self.adapter.address,
+            _CFG,
+            timeouts=timeouts,
+            min_request_interval=min_request_interval,
+        )
 
     def test_one_connection_at_a_time_across_threads(self):
         """Polls and commands from different threads never overlap on the wire."""
@@ -180,7 +189,57 @@ class TestConnectionHandling(unittest.TestCase):
         self.assertNotIn("User-Agent", self.adapter.last_headers)
         self.assertIn("Accept-Encoding", self.adapter.last_headers)
 
-    def test_cycle_releases_adapter_lock(self):
+    def test_requests_are_spaced(self):
+        """Requests from any thread leave the adapter a minimum idle gap."""
+        interval = 0.15
+        unit = self._make_unit(min_request_interval=interval)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(unit.set_fan_speed, "low") for _ in range(4)]
+            for future in futures:
+                future.result()
+        times = [t for t, _ in self.adapter.arrivals]
+        self.assertEqual(len(times), 4)
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        # Arrival-to-arrival includes the response time on top of the gap.
+        for gap in gaps:
+            self.assertGreaterEqual(gap, interval + self.adapter.delay - 0.01)
+
+    def test_retry_is_spaced(self):
+        """The retry after a timeout also waits for the interval."""
+        interval = 0.3
+        unit = self._make_unit(timeouts=(0.5, 0.2), min_request_interval=interval)
+        self.adapter.hang = True
+        unit.set_mode("cool")
+        times = [t for t, _ in self.adapter.arrivals]
+        self.assertEqual(len(times), 2)
+        self.assertGreaterEqual(times[1] - times[0], 0.2 + interval - 0.01)
+
+    def test_waiting_requests_are_served_in_order(self):
+        """Threads waiting on a busy adapter go first-come-first-served."""
+        unit = self._make_unit()
+        gate = _get_adapter_gate(self.adapter.address)
+        speeds = ["quiet", "low", "powerful", "superPowerful", "superQuiet"]
+        threads = []
+        gate.acquire()  # adapter busy, e.g. a poll in progress
+        try:
+            for i, speed in enumerate(speeds):
+                thread = threading.Thread(target=unit.set_fan_speed, args=(speed,))
+                thread.start()
+                threads.append(thread)
+                deadline = time.monotonic() + 2.0
+                while len(gate._queue) < i + 1 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+        finally:
+            gate.release()
+        for thread in threads:
+            thread.join()
+        sent = [
+            json.loads(body)["c"]["indoorUnit"]["status"]["fanSpeed"]
+            for _, body in self.adapter.arrivals
+        ]
+        self.assertEqual(sent, speeds)
+
+    def test_cycle_releases_adapter_gate(self):
         """begin_cycle() is idempotent and end_cycle() frees the adapter."""
         unit = self._make_unit()
         unit.begin_cycle()
@@ -188,18 +247,19 @@ class TestConnectionHandling(unittest.TestCase):
         unit.end_cycle()
         unit.end_cycle()
 
-        acquired = []
-
         def other_thread():
-            lock = _get_unit_lock(self.adapter.address)
-            acquired.append(lock.acquire(timeout=1.0))
-            if acquired[-1]:
-                lock.release()
+            with _get_adapter_gate(self.adapter.address):
+                pass
 
-        thread = threading.Thread(target=other_thread)
+        thread = threading.Thread(target=other_thread, daemon=True)
         thread.start()
-        thread.join()
-        self.assertEqual(acquired, [True])
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+
+    def test_default_interval_applies(self):
+        """Units get the library default interval unless told otherwise."""
+        unit = PyKumo("Test Unit", self.adapter.address, _CFG)
+        self.assertEqual(unit._min_request_interval, UNIT_MIN_REQUEST_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

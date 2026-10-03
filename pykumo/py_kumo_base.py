@@ -1,5 +1,6 @@
 """Class used to represent indoor units"""
 
+import collections
 import hashlib
 import base64
 import json
@@ -16,6 +17,7 @@ from .const import (
     W_PARAM,
     S_PARAM,
     UNIT_CONNECT_TIMEOUT_SECONDS,
+    UNIT_MIN_REQUEST_INTERVAL_SECONDS,
     UNIT_RESPONSE_TIMEOUT_SECONDS,
 )
 
@@ -28,26 +30,101 @@ _LOGGER = logging.getLogger(__name__)
 # thread-safe, so a per-thread store is required.
 _tl = threading.local()
 
-# Process-wide, per-adapter locks. Thread-local sessions alone do not bound
+
+# Process-wide, per-adapter gates. Thread-local sessions alone do not bound
 # the number of connections to an adapter: HA's executor can run a poll and
 # one or more commands (or two polls) for the same unit on different threads
 # at once, each with its own session and socket. The adapters have very few
-# socket slots, so all traffic to a given address is serialized here: at most
-# one in-flight request (and one TCP connection) per adapter per process.
-# RLock so that requests nested inside a cycle on the same thread (e.g.
-# do_reboot() or schedule fetch() during update_status()) don't deadlock.
-_unit_locks: dict[str, threading.RLock] = {}
-_unit_locks_guard = threading.Lock()
+# socket slots and little memory, so all traffic to a given address goes
+# through one gate, which:
+# - serializes it: at most one in-flight request (and one TCP connection)
+#   per adapter per process;
+# - queues waiting threads first-come-first-served, so a command issued
+#   during a poll runs right after it rather than at an arbitrary point;
+# - spaces requests out so the adapter gets a minimum idle gap between the
+#   end of one request and the start of the next.
+# The gate is reentrant so that requests nested inside a cycle on the same
+# thread (e.g. do_reboot() or schedule fetch() during update_status()) don't
+# deadlock.
+class _AdapterGate:
+    """FIFO, reentrant, rate-limited gate for one adapter address."""
+
+    def __init__(self, address: str):
+        self._address = address
+        self._cond = threading.Condition(threading.Lock())
+        self._queue = collections.deque()
+        self._owner = None
+        self._depth = 0
+        # monotonic time the last request to this adapter finished; only
+        # read or written by the thread that owns the gate.
+        self._last_request_end = None
+
+    def acquire(self):
+        """Wait for this thread's turn, then own the gate."""
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner == me:
+                self._depth += 1
+                return
+            ticket = object()
+            self._queue.append(ticket)
+            if self._owner is not None:
+                _LOGGER.debug(
+                    "Queued request to %s behind %d other(s)",
+                    self._address,
+                    len(self._queue),
+                )
+            while self._owner is not None or self._queue[0] is not ticket:
+                self._cond.wait()
+            self._queue.popleft()
+            self._owner = me
+            self._depth = 1
+
+    def release(self):
+        """Give up one level of ownership; wake the next in line at zero."""
+        with self._cond:
+            if self._owner != threading.get_ident():
+                raise RuntimeError("Releasing adapter gate not owned by thread")
+            self._depth -= 1
+            if self._depth == 0:
+                self._owner = None
+                self._cond.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+    def wait_for_slot(self, min_interval: float) -> None:
+        """Sleep until min_interval has passed since the last request to
+        this adapter finished. Caller must own the gate.
+        """
+        if self._last_request_end is None or min_interval <= 0:
+            return
+        delay = self._last_request_end + min_interval - time.monotonic()
+        if delay > 0:
+            _LOGGER.debug("Rate limit: waiting %.3fs for %s", delay, self._address)
+            time.sleep(delay)
+
+    def request_finished(self) -> None:
+        """Record that a request just finished. Caller must own the gate."""
+        self._last_request_end = time.monotonic()
 
 
-def _get_unit_lock(address: str) -> threading.RLock:
-    """Return the process-wide lock serializing traffic to address."""
-    with _unit_locks_guard:
-        lock = _unit_locks.get(address)
-        if lock is None:
-            lock = threading.RLock()
-            _unit_locks[address] = lock
-        return lock
+_gates: dict[str, _AdapterGate] = {}
+_gates_guard = threading.Lock()
+
+
+def _get_adapter_gate(address: str) -> _AdapterGate:
+    """Return the process-wide gate for traffic to address."""
+    with _gates_guard:
+        gate = _gates.get(address)
+        if gate is None:
+            gate = _AdapterGate(address)
+            _gates[address] = gate
+        return gate
 
 
 def _get_session(address: str) -> requests.Session:
@@ -56,8 +133,8 @@ def _get_session(address: str) -> requests.Session:
     Creates a new Session on first access per thread. pool_connections=1
     and pool_maxsize=1 with pool_block=True ensure urllib3 never silently
     opens secondary connections under contention. Across threads, the
-    per-address lock (_get_unit_lock) is what limits the adapter to one
-    connection at a time; callers must hold it while using the session.
+    per-address gate (_get_adapter_gate) is what limits the adapter to one
+    connection at a time; callers must own it while using the session.
     """
     if not hasattr(_tl, "sessions"):
         _tl.sessions = {}
@@ -112,8 +189,21 @@ class PyKumoBase:
 
     # pylint: disable=R0904, R0902
 
-    def __init__(self, name, addr, cfg_json, timeouts=None, serial=None):
-        """Constructor"""
+    def __init__(
+        self,
+        name,
+        addr,
+        cfg_json,
+        timeouts=None,
+        serial=None,
+        min_request_interval=None,
+    ):
+        """Constructor
+
+        min_request_interval: minimum seconds between the end of one request
+        to this unit's adapter and the start of the next (default
+        UNIT_MIN_REQUEST_INTERVAL_SECONDS). 0 disables rate limiting.
+        """
         self._name = name
         self._address = addr
         self._serial = serial
@@ -136,6 +226,9 @@ class PyKumoBase:
                 timeouts[1] if timeouts[1] else UNIT_RESPONSE_TIMEOUT_SECONDS
             )
             self._timeouts = (connect_timeout, response_timeout)
+        if min_request_interval is None:
+            min_request_interval = UNIT_MIN_REQUEST_INTERVAL_SECONDS
+        self._min_request_interval = max(0.0, float(min_request_interval))
         self._status = {}
         self._profile = {}
         self._sensors = []
@@ -176,7 +269,7 @@ class PyKumoBase:
         calls will reuse the same TCP connection (keep-alive) until
         end_cycle() is called. Safe to call multiple times; idempotent.
 
-        The cycle holds the adapter's lock until end_cycle(), so commands
+        The cycle holds the adapter's gate until end_cycle(), so commands
         issued from other threads wait for the cycle to finish instead of
         opening a second connection to the adapter. begin_cycle() and
         end_cycle() must be called from the same thread.
@@ -189,7 +282,7 @@ class PyKumoBase:
             _tl.cycles = set()
         if self._address in _tl.cycles:
             return
-        _get_unit_lock(self._address).acquire()
+        _get_adapter_gate(self._address).acquire()
         _tl.cycles.add(self._address)
         getattr(_tl, "failed_cycles", set()).discard(self._address)
 
@@ -203,7 +296,7 @@ class PyKumoBase:
         cycles = getattr(_tl, "cycles", set())
         if self._address in cycles:
             cycles.discard(self._address)
-            _get_unit_lock(self._address).release()
+            _get_adapter_gate(self._address).release()
 
     def close(self):
         """Close any open HTTP session to this unit. Alias for end_cycle()
@@ -222,7 +315,10 @@ class PyKumoBase:
           response, sending a clean FIN to the adapter.
 
         Hardening:
-        - At most one request in flight per adapter across all threads
+        - At most one request in flight per adapter across all threads;
+          waiting threads are served first-come-first-served
+        - At least min_request_interval seconds of idle time on the adapter
+          between requests (including retries)
         - Body fully drained before JSON parsing (no abandoned sockets on malformed responses)
         - response.close() in every exit path
         - Session dropped on ANY transport error
@@ -236,11 +332,12 @@ class PyKumoBase:
             _LOGGER.warning("Unit %s address not set", self._name)
             return {}
 
-        with _get_unit_lock(self._address):
+        with _get_adapter_gate(self._address):
             return self._request_locked(post_data)
 
     def _request_locked(self, post_data):
-        """Body of _request(); caller must hold the adapter's lock."""
+        """Body of _request(); caller must own the adapter's gate."""
+        gate = _get_adapter_gate(self._address)
         in_cycle = self._address in getattr(_tl, "cycles", set())
         if in_cycle and self._address in getattr(_tl, "failed_cycles", set()):
             _LOGGER.debug(
@@ -258,6 +355,7 @@ class PyKumoBase:
         token_param = {"m": token}
 
         for attempt in range(2):
+            gate.wait_for_slot(self._min_request_interval)
             session = _get_session(self._address)
             response = None
             try:
@@ -321,6 +419,11 @@ class PyKumoBase:
                     if isinstance(ex, RequestsConnectionError):
                         self._mark_cycle_failed(in_cycle)
                     return {}
+
+            finally:
+                # Successful or not, the adapter just handled a request;
+                # the next one waits min_request_interval from now.
+                gate.request_finished()
 
         return {}
 
