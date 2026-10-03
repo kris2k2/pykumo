@@ -18,6 +18,8 @@ from .py_kumo_base import PyKumoBase
 
 _LOGGER = logging.getLogger(__name__)
 ALL_FAN_SPEEDS = ["superQuiet", "quiet", "low", "Low", "powerful", "superPowerful"]
+# adapter/status flags that change which modes the unit offers.
+_ADAPTER_MODE_FLAGS = ("autoModePrevention", "userHasModeDry", "userHasModeHeat")
 
 
 def merge(d, v):
@@ -61,6 +63,8 @@ class PyKumo(PyKumoBase):
         # adapter-status overrides that update_status() applies to _profile.
         self._raw_profile = None
         self._raw_profile_read_at = None
+        # Last value seen for each of _ADAPTER_MODE_FLAGS in adapter/status.
+        self._adapter_mode_flags = {}
         # When the adapter last reported no MHK2 thermostat attached.
         self._no_mhk2_seen_at = None
         super().__init__(name, addr, cfg_json, timeouts, serial, min_request_interval)
@@ -171,12 +175,16 @@ class PyKumo(PyKumoBase):
     def _compute_has_mode_auto(profile: dict, auto_mode_prevention: bool) -> bool:
         """True if the unit supports auto (heat/cool) mode.
 
-        Honors the adapter's autoModePrevention flag, but falls back to the
-        unit profile's auto setpoints, since some installer configurations
-        set autoModePrevention=True even though the unit (and the Mitsubishi
-        Comfort app) treat auto mode as supported. Checks both
+        Auto switches between heating and cooling, so a unit without heat
+        mode (e.g. a cooling-only PEFY) never has it, whatever else says so.
+        Otherwise honors the adapter's autoModePrevention flag, but falls
+        back to the unit profile's auto setpoints, since some installer
+        configurations set autoModePrevention=True even though the unit (and
+        the Mitsubishi Comfort app) treat auto mode as supported. Checks both
         maximumSetPoints and minimumSetPoints for an 'auto' key.
         """
+        if not profile.get("hasModeHeat", False):
+            return False
         if not auto_mode_prevention:
             return True
         max_sp = profile.get("maximumSetPoints", {}) or {}
@@ -286,6 +294,9 @@ class PyKumo(PyKumoBase):
                             f"{str(ke)}"
                         )
                         return False
+                    # An incomplete answer only adds to what's already known,
+                    # so a capability the unit reported earlier isn't lost.
+                    raw_profile = {**(self._raw_profile or {}), **raw_profile}
                     self._raw_profile = raw_profile
                     # Re-read next poll if the adapter only answered in part
                     # (hasModeAuto never comes from the profile).
@@ -313,13 +324,21 @@ class PyKumo(PyKumoBase):
                 response = self._retrieve_attributes(query, needed)
                 try:
                     status = response["r"]["adapter"]["status"]
-                    profile["hasModeAuto"] = self._compute_has_mode_auto(
-                        profile, status.get("autoModePrevention", False)
-                    )
-                    if not status.get("userHasModeDry", False):
+                    # A flag is missing when the adapter only answered in
+                    # part, which says nothing about it: keep the last value
+                    # seen rather than letting a mode come and go.
+                    for key in _ADAPTER_MODE_FLAGS:
+                        if isinstance(status.get(key), bool):
+                            self._adapter_mode_flags[key] = status[key]
+                    flags = self._adapter_mode_flags
+                    # The user can turn dry and heat off in the app.
+                    if flags.get("userHasModeDry") is False:
                         profile["hasModeDry"] = False
-                    if not status.get("userHasModeHeat", False):
+                    if flags.get("userHasModeHeat") is False:
                         profile["hasModeHeat"] = False
+                    profile["hasModeAuto"] = self._compute_has_mode_auto(
+                        profile, flags.get("autoModePrevention", False)
+                    )
                     try:
                         profile["wifiRSSI"] = status["localNetwork"]["stationMode"][
                             "RSSI"
