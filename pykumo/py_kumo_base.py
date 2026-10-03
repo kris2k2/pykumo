@@ -12,7 +12,9 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout
 from urllib3.util import SKIP_HEADER
+from . import traffic
 from .const import (
+    REQUEST_LATENCY_SAMPLES,
     CACHE_INTERVAL_SECONDS,
     W_PARAM,
     S_PARAM,
@@ -231,6 +233,8 @@ class PyKumoBase:
         self._min_request_interval = max(0.0, float(min_request_interval))
         self._status = {}
         self._profile = {}
+        # Round-trip seconds of recent requests that got an answer.
+        self._request_latencies = collections.deque(maxlen=REQUEST_LATENCY_SAMPLES)
         self._sensors = []
         self._last_status_update = time.monotonic() - 2 * CACHE_INTERVAL_SECONDS
 
@@ -362,6 +366,15 @@ class PyKumoBase:
                 _LOGGER.debug(
                     "Issue request %s %s (attempt %d)", url, post_data, attempt
                 )
+                traffic.log_event(
+                    "local",
+                    "send",
+                    unit=self._name,
+                    address=self._address,
+                    attempt=attempt,
+                    body=traffic.decode_body(post_data),
+                )
+                started = time.monotonic()
                 response = session.put(
                     url,
                     headers=headers,
@@ -374,6 +387,18 @@ class PyKumoBase:
                 # body is already fully read so urllib3 can return the
                 # connection to the pool cleanly rather than abandoning it.
                 content = response.content
+                elapsed = time.monotonic() - started
+                self._request_latencies.append(elapsed)
+                traffic.log_event(
+                    "local",
+                    "recv",
+                    unit=self._name,
+                    address=self._address,
+                    attempt=attempt,
+                    status=response.status_code,
+                    elapsed_ms=round(elapsed * 1000),
+                    body=traffic.decode_body(content),
+                )
                 response.close()
                 response = None
 
@@ -388,6 +413,14 @@ class PyKumoBase:
 
             except Timeout as ex:
                 _LOGGER.debug("Timeout on attempt %d for %s: %s", attempt, url, str(ex))
+                traffic.log_event(
+                    "local",
+                    "error",
+                    unit=self._name,
+                    address=self._address,
+                    attempt=attempt,
+                    error=f"{type(ex).__name__}: {ex}",
+                )
                 self._cleanup_response(response)
                 # A timeout means the connection state is unknowable —
                 # drop it rather than risk reusing a half-dead socket.
@@ -412,6 +445,14 @@ class PyKumoBase:
                     str(ex),
                     type(ex).__name__,
                 )
+                traffic.log_event(
+                    "local",
+                    "error",
+                    unit=self._name,
+                    address=self._address,
+                    attempt=attempt,
+                    error=f"{type(ex).__name__}: {ex}",
+                )
                 self._cleanup_response(response)
                 _drop_session(self._address)
                 if attempt == 1:
@@ -434,6 +475,29 @@ class PyKumoBase:
         if not hasattr(_tl, "failed_cycles"):
             _tl.failed_cycles = set()
         _tl.failed_cycles.add(self._address)
+
+    def get_request_latency(self):
+        """Return round-trip times of recent requests to the adapter.
+
+        Covers the last REQUEST_LATENCY_SAMPLES requests that got an
+        answer, timed from sending the request to receiving the full
+        response. Time spent waiting for the adapter to be free (other
+        threads' requests, rate limiting) is not included, nor are requests
+        that timed out or failed to connect.
+
+        Returns a dict of milliseconds -- last, average, min, max -- plus
+        the number of samples, or None if no request has completed yet.
+        """
+        samples = list(self._request_latencies)
+        if not samples:
+            return None
+        return {
+            "last": round(samples[-1] * 1000, 1),
+            "average": round(sum(samples) / len(samples) * 1000, 1),
+            "min": round(min(samples) * 1000, 1),
+            "max": round(max(samples) * 1000, 1),
+            "samples": len(samples),
+        }
 
     def has_profile(self) -> bool:
         """Return True if the unit profile has been populated from a successful poll.

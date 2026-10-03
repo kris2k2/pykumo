@@ -17,6 +17,7 @@ from typing import Dict, List
 
 import requests
 
+from . import traffic
 from .const import W_PARAM, S_PARAM
 
 _LOGGER = logging.getLogger(__name__)
@@ -136,6 +137,13 @@ def probe_ip(ip: str, creds: dict, timeout: float) -> bool:
         "Content-Type": "application/json",
     }
     try:
+        traffic.log_event(
+            "local",
+            "send",
+            address=ip,
+            probe=True,
+            body=traffic.decode_body(_PROBE_QUERY),
+        )
         resp = requests.put(
             url,
             headers=headers,
@@ -143,11 +151,21 @@ def probe_ip(ip: str, creds: dict, timeout: float) -> bool:
             params={"m": token},
             timeout=timeout,
         )
+        traffic.log_event(
+            "local",
+            "recv",
+            address=ip,
+            probe=True,
+            status=resp.status_code,
+            body=traffic.decode_body(resp.content),
+        )
         if resp.ok:
             data = resp.json()
             # A valid response has an "r" key with adapter/indoor unit data
             if isinstance(data, dict) and "r" in data:
                 return True
-    except Exception:
-        pass
+    except Exception as ex:
+        traffic.log_event(
+            "local", "error", address=ip, probe=True, error=f"{type(ex).__name__}: {ex}"
+        )
     return False

@@ -6,6 +6,7 @@ requests it received.
 """
 
 import json
+import socket
 import threading
 import time
 import unittest
@@ -13,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pykumo import PyKumo
-from pykumo.const import UNIT_MIN_REQUEST_INTERVAL_SECONDS
+from pykumo.const import REQUEST_LATENCY_SAMPLES, UNIT_MIN_REQUEST_INTERVAL_SECONDS
 from pykumo.py_kumo_base import _get_adapter_gate
 
 _CFG = {
@@ -64,12 +65,22 @@ _RESPONSE = {
 }
 
 
+def _peer_closed(sock) -> bool:
+    """True if the client has already closed this connection (FIN received)."""
+    try:
+        return sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+    except BlockingIOError:
+        return False  # open, nothing to read yet
+    except OSError:
+        return True
+
+
 class _FakeAdapter:
     """Threaded HTTP server that tracks concurrent connections."""
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.open = 0
+        self.connections = set()  # sockets whose handler hasn't finished
         self.max_open = 0
         self.requests = 0
         self.last_headers = None
@@ -84,15 +95,20 @@ class _FakeAdapter:
             def setup(self):
                 super().setup()
                 with adapter.lock:
-                    adapter.open += 1
-                    adapter.max_open = max(adapter.max_open, adapter.open)
+                    # A handler only notices the client's FIN when it next
+                    # reads, which can be after the client has already
+                    # opened its next connection. Count only connections
+                    # the client still has open.
+                    still_open = [c for c in adapter.connections if not _peer_closed(c)]
+                    adapter.connections.add(self.connection)
+                    adapter.max_open = max(adapter.max_open, len(still_open) + 1)
 
             def finish(self):
                 try:
                     super().finish()
                 finally:
                     with adapter.lock:
-                        adapter.open -= 1
+                        adapter.connections.discard(self.connection)
 
             def log_message(self, *args):
                 pass
@@ -255,6 +271,38 @@ class TestConnectionHandling(unittest.TestCase):
         thread.start()
         thread.join(timeout=1.0)
         self.assertFalse(thread.is_alive())
+
+    def test_request_latency_measures_round_trip_only(self):
+        """Latency covers the exchange, not the rate-limit wait before it."""
+        self.adapter.delay = 0.05
+        unit = self._make_unit(min_request_interval=0.5)
+        self.assertIsNone(unit.get_request_latency())
+
+        self.assertTrue(unit.update_status())
+
+        latency = unit.get_request_latency()
+        self.assertEqual(latency["samples"], self.adapter.requests)
+        self.assertGreaterEqual(latency["min"], 50)
+        # Each request after the first waited 0.5s for its slot; counting that
+        # would put samples above 550ms.
+        self.assertLess(latency["max"], 450)
+        self.assertLessEqual(latency["min"], latency["average"])
+        self.assertLessEqual(latency["average"], latency["max"])
+        self.assertTrue(latency["min"] <= latency["last"] <= latency["max"])
+
+    def test_request_latency_window_is_bounded(self):
+        """Only the most recent REQUEST_LATENCY_SAMPLES requests are kept."""
+        unit = self._make_unit()
+        for _ in range(REQUEST_LATENCY_SAMPLES + 3):
+            unit._request(b'{"c":{"indoorUnit":{"status":{}}}}')
+        self.assertEqual(unit.get_request_latency()["samples"], REQUEST_LATENCY_SAMPLES)
+
+    def test_timeouts_do_not_count_as_latency(self):
+        """Requests that never got an answer leave no latency sample."""
+        unit = self._make_unit(timeouts=(0.5, 0.2))
+        self.adapter.hang = True
+        self.assertFalse(unit.update_status())
+        self.assertIsNone(unit.get_request_latency())
 
     def test_default_interval_applies(self):
         """Units get the library default interval unless told otherwise."""
