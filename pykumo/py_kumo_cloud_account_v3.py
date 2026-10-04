@@ -180,38 +180,55 @@ class KumoCloudV3:
 
     # ── REST API ────────────────────────────────────────────
 
-    def _get(self, path: str):
-        """Authenticated GET with automatic token refresh on 401."""
-        url = f"{V3_BASE_URL}{path}"
-        try:
-            resp = requests.get(
-                url, headers=self._auth_headers(), timeout=V3_CLOUD_TIMEOUT
-            )
-        except Exception as ex:
-            _log_http("GET", path, error=ex)
-            _LOGGER.warning("V3 GET %s error: %s", path, ex)
-            return None
-        _log_http("GET", path, resp=resp)
+    def _call(self, method: str, path: str, body=None):
+        """Authenticated request with automatic token refresh on 401.
 
-        if resp.status_code == 401 and self.refresh():
+        Returns the parsed JSON response, or None on a transport error, an
+        HTTP error or a body that isn't JSON.
+        """
+        url = f"{V3_BASE_URL}{path}"
+        resp = None
+        for attempt in range(2):
             try:
-                resp = requests.get(
-                    url, headers=self._auth_headers(), timeout=V3_CLOUD_TIMEOUT
+                resp = requests.request(
+                    method,
+                    url,
+                    headers=self._auth_headers(),
+                    json=body,
+                    timeout=V3_CLOUD_TIMEOUT,
                 )
             except Exception as ex:
-                _log_http("GET", path, error=ex)
-                _LOGGER.warning("V3 GET %s error after refresh: %s", path, ex)
+                _log_http(method, path, body, error=ex)
+                _LOGGER.warning(
+                    "V3 %s %s error%s: %s",
+                    method,
+                    path,
+                    " after refresh" if attempt else "",
+                    ex,
+                )
                 return None
-            _log_http("GET", path, resp=resp)
+            _log_http(method, path, body, resp=resp)
+            if attempt or resp.status_code != 401 or not self.refresh():
+                break
 
         if not resp.ok:
-            _LOGGER.warning("V3 GET %s: HTTP %s", path, resp.status_code)
+            _LOGGER.warning(
+                "V3 %s %s: HTTP %s %s",
+                method,
+                path,
+                resp.status_code,
+                resp.text[:200],
+            )
             return None
 
         try:
             return resp.json()
         except Exception:
             return None
+
+    def _get(self, path: str):
+        """Authenticated GET with automatic token refresh on 401."""
+        return self._call("GET", path)
 
     def get_sites(self) -> list:
         result = self._get("/v3/sites/")
@@ -223,6 +240,23 @@ class KumoCloudV3:
 
     def get_device_status(self, serial: str) -> Optional[dict]:
         return self._get(f"/v3/devices/{serial}/status")
+
+    def relay_command(self, serial: str, command: dict) -> Optional[dict]:
+        """Have the cloud pass a local-API command on to a unit's adapter.
+
+        command is what the local API takes inside its "c" object, e.g.
+        {"adapter": {"status": {"ledDisabled": True}}}. The Comfort app uses
+        this endpoint for adapter settings; whether queries (empty objects)
+        come back with the adapter's answer is still being worked out.
+        Returns the cloud's JSON response, or None on failure.
+        """
+        if not self._access_token and not self.login():
+            return None
+        return self._call(
+            "POST",
+            f"/v3/devices/{serial}/relay-command",
+            {"serial": serial, **command},
+        )
 
     def cancel(self):
         """Signal the Socket.IO poll loop to stop (for clean HA shutdown)."""

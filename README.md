@@ -128,6 +128,20 @@ logger.propagate = False
 ```
 Each line has `ts`, `channel` (`local`, `cloud` or `socketio`) and `direction` (`send`, `recv` or `error`), plus the request or response body. Socket.IO frames are decoded into `packets` with the event name and arguments. Call `pykumo.traffic.set_redact_secrets(False)` to log credentials in the clear; don't share such a file.
 
+### Send Requests Through the Kumo Cloud Relay (experimental)
+Kumo Cloud no longer hands out the password and cryptoSerial the local API needs, but the Comfort app sends some local-API commands to the adapter through the cloud's `relay-command` endpoint (see [Cloud_api_v3.md](Cloud_api_v3.md)). For debugging, pykumo can send a unit's requests that way instead of over the local network:
+```
+kumos = account.make_pykumos(cloud_relay=True)
+```
+or, for one unit, `PyKumo(name, None, None, serial=serial, cloud_relay=KumoCloudV3(username, password))`. No local credentials or address are needed. It's not yet known which queries the relay answers.
+
+To find out, `pykumo.relay_probe` sends read-only queries to every unit on an account through the relay and prints the answers, looking for credential fields in them:
+```
+KUMO_PASSWORD=... python -m pykumo.relay_probe --username you@example.com
+python -m pykumo.relay_probe --username you@example.com --serial <serial> --query '{"adapter":{}}'
+```
+Credential-like fields are masked unless you add `--show-secrets`. If a password and cryptoSerial turn up, `--serial <serial> --verify-address <unit-ip>` tries them on the adapter's local API. `--traffic` logs every cloud exchange to stderr. Queries that set values are refused unless you add `--allow-writes`.
+
 ## Development
 
 Pull requests are welcome for new features or bug fixes. The primary maintainer's day job may make response times somewhat slow.

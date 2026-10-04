@@ -89,8 +89,9 @@ class PyKumo(PyKumoBase):
         serial=None,
         use_schedule: bool = False,
         min_request_interval=None,
+        cloud_relay=None,
     ):
-        """Constructor"""
+        """Constructor. See PyKumoBase for cloud_relay."""
         self._last_reboot = None
         self._unit_schedule = UnitSchedule(self) if use_schedule else None
         # indoorUnit/profile as last read from the adapter, before the
@@ -104,7 +105,15 @@ class PyKumo(PyKumoBase):
         self._no_mhk2_seen_at = None
         # When the adapter last reported no wireless sensor.
         self._no_sensor_seen_at = None
-        super().__init__(name, addr, cfg_json, timeouts, serial, min_request_interval)
+        super().__init__(
+            name,
+            addr,
+            cfg_json,
+            timeouts,
+            serial,
+            min_request_interval,
+            cloud_relay,
+        )
 
     def _rebootable_response(self, response):
         """

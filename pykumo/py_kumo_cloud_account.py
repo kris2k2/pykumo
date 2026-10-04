@@ -372,13 +372,19 @@ class KumoCloudAccount:
         init_update_status=True,
         use_schedule=False,
         min_request_interval=None,
+        cloud_relay=False,
     ):
         """Return a dict mapping names of all indoor units to newly-created
         `PyKumoBase` objects
 
         min_request_interval: minimum seconds between requests to each
         adapter; None uses UNIT_MIN_REQUEST_INTERVAL_SECONDS, 0 disables.
+
+        cloud_relay: for debugging, send every unit's requests through Kumo
+        Cloud's relay-command endpoint, logged in as this account, instead
+        of to the adapters on the local network.
         """
+        relay = KumoCloudV3(self._username, self._password) if cloud_relay else None
         kumos = {}
         for unitSerial in list(self.get_all_units()):
             name = self.get_name(unitSerial)
@@ -403,6 +409,7 @@ class KumoCloudAccount:
                 serial=unitSerial,
                 use_schedule=use_schedule,
                 min_request_interval=min_request_interval,
+                cloud_relay=relay,
             )
 
         if init_update_status:

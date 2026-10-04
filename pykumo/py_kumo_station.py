@@ -21,9 +21,18 @@ class PyKumoStation(PyKumoBase):
         timeouts=None,
         serial=None,
         min_request_interval=None,
+        cloud_relay=None,
     ):
-        """Constructor"""
-        super().__init__(name, addr, cfg_json, timeouts, serial, min_request_interval)
+        """Constructor. See PyKumoBase for cloud_relay."""
+        super().__init__(
+            name,
+            addr,
+            cfg_json,
+            timeouts,
+            serial,
+            min_request_interval,
+            cloud_relay,
+        )
 
     def update_status(self):
         """Retrieve and cache current status dictionary if enough time

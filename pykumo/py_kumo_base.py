@@ -199,20 +199,33 @@ class PyKumoBase:
         timeouts=None,
         serial=None,
         min_request_interval=None,
+        cloud_relay=None,
     ):
         """Constructor
 
         min_request_interval: minimum seconds between the end of one request
         to this unit's adapter and the start of the next (default
         UNIT_MIN_REQUEST_INTERVAL_SECONDS). 0 disables rate limiting.
+
+        cloud_relay: for debugging, a KumoCloudV3 (or anything with its
+        relay_command(serial, command) method) to send this unit's requests
+        through Kumo Cloud's relay-command endpoint instead of to the
+        adapter on the local network. serial is then required, and
+        cfg_json (the local credentials) and addr may be None.
         """
         self._name = name
         self._address = addr
         self._serial = serial
-        self._security = {
-            "password": base64.b64decode(cfg_json["password"]),
-            "crypto_serial": bytearray.fromhex(cfg_json["crypto_serial"]),
-        }
+        self._cloud_relay = cloud_relay
+        if cloud_relay is not None and not serial:
+            raise ValueError("cloud_relay needs the unit's serial")
+        if cfg_json is None and cloud_relay is not None:
+            self._security = None
+        else:
+            self._security = {
+                "password": base64.b64decode(cfg_json["password"]),
+                "crypto_serial": bytearray.fromhex(cfg_json["crypto_serial"]),
+            }
         if not timeouts:
             _LOGGER.info("Use default timeouts")
             self._timeouts = (
@@ -331,13 +344,38 @@ class PyKumoBase:
           connection error on both attempts), the rest of the cycle's
           requests fail fast instead of piling more connections onto an
           adapter that is already struggling
+
+        With cloud_relay set, none of the above applies: the request goes
+        through Kumo Cloud instead (see _relay_request()).
         """
+        if self._cloud_relay is not None:
+            return self._relay_request(post_data)
+
         if not self._address:
             _LOGGER.warning("Unit %s address not set", self._name)
             return {}
 
         with _get_adapter_gate(self._address):
             return self._request_locked(post_data)
+
+    def _relay_request(self, post_data):
+        """Send a local-API request through Kumo Cloud's relay-command.
+
+        The cloud takes the contents of the local API's "c" object. Its
+        answer is returned in the local API's {"r": ...} shape, unless it
+        already has that shape, so callers can't tell the difference.
+        """
+        try:
+            command = json.loads(post_data)["c"]
+        except (ValueError, KeyError, TypeError) as ex:
+            _LOGGER.warning("Can't relay request %s: %s", post_data, ex)
+            return {}
+        started = time.monotonic()
+        response = self._cloud_relay.relay_command(self._serial, command)
+        if not isinstance(response, dict):
+            return {}
+        self._request_latencies.append(time.monotonic() - started)
+        return response if "r" in response else {"r": response}
 
     def _request_locked(self, post_data):
         """Body of _request(); caller must own the adapter's gate."""
