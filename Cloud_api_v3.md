@@ -17,7 +17,9 @@ This document is published in an effort to discover enough of the v3 API to allo
 ### Remaining to be documented
 
 Portions of the v3 API are not yet documented:
-- PATCH endpoint structure
+- PATCH bodies other than zone rename and filter reset (holds, schedules, group settings)
+- Writes to the `/v4/` schedule endpoints
+- `/v3/accounts/me` in detail
 
 ## WebSocket interface
 More information -- including the indoor unit password -- is available via a WebSocket interface. [HA-Kumo-WS](https://github.com/EnumC/ha_kumo_ws) is an entirely cloud-based integration and has examples of using this WebSocket.
@@ -32,6 +34,15 @@ A traffic capture (pykumo 0.5.3, app version `3.2.4`, adapter firmware `02.06.26
 - **`device_update` fields** match `devices/{device-serial}` below, plus `realValues`, `collectMethod` and `date`. A partial `device_update` (only the changed operating values) follows each `device_status_v2`.
 - **Setpoint limits.** The status endpoint's `minSetPoint`/`maxSetPoint` (19.5/28 here) match the local `adapter/status` fields `userMinCoolSetPoint`/`userMaxHeatSetPoint`: limits set in the app, which can be narrower than the profile's `minimumSetPoints`/`maximumSetPoints` (cool 19-30, heat 17-28, auto 19-28 on the same unit). pykumo's `get_setpoint_limits()` combines the two.
 
+### Observed in a capture of the Comfort app (October 2026)
+A capture of the official iOS app (Comfort `3.5.0`, adapter firmware `02.06.26`) covering a full logout and login, mode and fan-speed changes, an LED toggle, a zone rename and a filter reset showed:
+
+- **The app gets no local credentials either.** No request or response on either host, and no Socket.IO frame, carried a `cryptoSerial`, `cryptoKeySet` or adapter `password`. So their absence is not down to pykumo's request shape, its `appVersion`, or `isPoliciesAccepted` (still `false` after the app's own login, with no prompt). The app controls units through the cloud instead; see [Commands](#commands).
+- **Three `force_adapter_request` types.** The app sends `adapterStatus`, `profile` and `iuStatus` together. `adapterStatus` gets an `adapter_update` as above; `profile` gets a `profile_update`, the same object as [`devices/{device-serial}/profile`](#devicesdevice-serialprofile) (not wrapped in a list); `iuStatus` gets a full `device_update`.
+- **`unsubscribe [<serial>]`** gets `unsubscribed ["Successfully unsubscribed from: <serial>"]`.
+- **`realValues` in `device_update`.** After a command, the top-level fields show the value just requested and `realValues` appears to hold what the unit is actually reporting until it catches up. For example, sending `fanSpeed: "quiet"` then `"low"` produced `"fanSpeed": "low", "realValues": {"fanSpeed": "quiet"}`; sending `operationMode: "dry"` then `"off"` produced `"operationMode": "off", "power": 0, "realValues": {"operationMode": "dry", "power": 1}`. It is `{}` when the two agree.
+- **Transport.** The app opens with long polling and upgrades to a WebSocket (`2probe` → `3probe` → `5`). Long polling alone, as pykumo uses it, also works.
+
 ## Hostname
 The scheme and hostname for all endpoints described below is https://app-prod.kumocloud.com/
 
@@ -43,6 +54,19 @@ All or most of the API endpoints seem to require, at a minimum, an `x-app-versio
   Accept-Language: en-US, en
   x-app-version: 3.0.3
 ```
+
+As of October 2026 the iOS app (version `3.5.0`) sends:
+```
+  Accept: application/json
+  Accept-Encoding: gzip, deflate, br
+  Accept-Language: en-CA,en;q=0.9
+  Content-Type: application/json
+  x-app-version: 3.5.0
+  app-env: prd
+  x-allow-cache: true
+  User-Agent: kumocloud/2383 CFNetwork/3896.100.1.2.1 Darwin/27.0.0
+```
+plus Sentry tracing headers (`baggage`, `sentry-trace`). pykumo sends `x-app-version: 3.2.4` without the others and is served normally.
 
 ## Authorization
 
@@ -87,18 +111,20 @@ Example response:
 }
 ```
 
-The access token is short-lived; expiration time about 20 minutes.
-The refresh token is long-lived; expiration time about a month.
+The access token is short-lived: 20 minutes (`exp - iat` = 1200 s).
+The refresh token is long-lived. It was about a month in April 2025; as of October 2026 it is one year (`exp - iat` = 31557600 s). Both JWTs carry only `id`, `username`, `iat` and `exp`.
+
+The October 2026 login response also has `scheduleVersion` (`"v2"`) and `hasDemoAccess`, and `preferences` holds the app's UI settings (see [Preferences](#preferences)).
 
 #### JWT usage
-The access token must be provided to all other API requests, in an Authentication header as follows. This is standard JWT usage.
+The access token must be provided to all other API requests, in an Authorization header as follows. This is standard JWT usage.
 ```
-  Authentication: Bearer <token-string>
+  Authorization: Bearer <token-string>
 ```
 
 ### Refresh
 
-If the access token has expired but the refresh token is still valid, a POST to the refresh endpoint with an `Authentication` header (as above) containing the refresh token will provide a response body as follows, bearing new access and refresh tokens. No username or password is required to refresh the tokens.
+If the access token has expired but the refresh token is still valid, a POST to the refresh endpoint with an `Authorization` header (as above) containing the refresh token will provide a response body as follows, bearing new access and refresh tokens. No username or password is required to refresh the tokens.
 
 POST body:
 ```
@@ -112,25 +138,93 @@ Response:
 }
 ```
 
-Notably, the new refresh token will have a new expiration time one month in the future, and the old refresh token will cease to work.
+Notably, the new refresh token will have a new expiration time in the future (a month in April 2025, a year as of October 2026), and the old refresh token will cease to work.
 
 If the refresh token itself is expired (or not known), the Login endpoint (with username and password) may be used to obtain fresh tokens.
+
+### Logout
+`POST /v3/logout` with the access token and no body returns 200 with an empty body. Afterwards the token is refused (see [Errors](#errors)). Before logging out, the app unregisters its push token with `POST /v3/accounts/fcm/delete`.
 
 ## Account information
 
 **Endpoints**
-- Me: `/v3/accounts/me`
+- Me: `GET /v3/accounts/me`
+- Preferences: `PUT /v3/accounts/preferences`
+- Push registration: `POST /v3/accounts/fcm`, `POST /v3/accounts/fcm/delete`
+- App version gate: `GET /v3/config/new-version-overlay`
 
-A GET returns various account information, quite similar to the response to the initial Login POST.
+A GET of **Me** returns various account information, quite similar to the response to the initial Login POST.
 
 Details to-be-documented.
+
+### Preferences
+The app's UI state (`celsius`, survey and walkthrough flags, `zoneAndGroupTilesOrder`, `isMinMaxSetpointsEnabled`, and so on). The app PUTs the whole object, and the response is the stored object.
+
+### Push registration
+`POST /v3/accounts/fcm` with `{"deviceToken": "<firebase-token>"}` registers the phone for push notifications; `POST /v3/accounts/fcm/delete` with the same body removes it. Both return `{"success": true}`.
+
+### New version overlay
+Fetched by the app at startup, before login. Probably a forced-upgrade switch.
+```
+{"active": false, "minimumVersion": null}
+```
+
+## Notifications
+
+**Endpoints**
+- `GET /v3/notifications/active/unseen-count`
+- `GET /v3/notifications/active?page=1`
+- `GET /v3/notifications/resolved?page=1`
+- `PATCH /v3/notifications/seen`
+
+**Unseen count** populates the red dot on the notification bell in the Comfort app:
+```
+{"unseenCount": 1}
+```
+
+**Active** and **resolved** are paged (`next`, `previous`, `count`, `data`):
+```
+{
+    "next": null,
+    "previous": null,
+    "count": 1,
+    "data": [
+        {
+            "id": "<notification-id>",
+            "zoneId": "<zone-id>",
+            "active": true,
+            "severity": "INFO",
+            "type": "APP_NOTIFICATION",
+            "eventType": "filterReminder",
+            "data": {
+                "zoneId": "<zone-id>",
+                "accountId": "<user-id>",
+                "deviceSerial": "<device-serial>",
+                "channel": "filterReminder",
+                "requestType": "filter-reminder-notification"
+            },
+            "accountId": "<user-id>",
+            "seen": false,
+            "entityType": null,
+            "entityId": null,
+            "createdAt": "2026-09-14T07:29:02.385Z",
+            "updatedAt": "2026-09-14T07:29:02.385Z",
+            "resolvedAt": null,
+            "zone": {"id": "<zone-id>", "name": "<redacted>"},
+            "site": {"id": "<site-id>", "name": "<redacted>"}
+        }
+    ]
+}
+```
+
+**Seen** marks notifications as read. Body `{"notificationIds": ["<notification-id>"]}`; response `{}`.
 
 ## Sites
 
 **Endpoints**
 - Collection: `/v3/sites/`
-- ?? `/v3/sites/transfers/pending`
-- ?? `/v3/notifications/unseen-count`
+- Collection with addresses: `/v3/sites/full`
+- Pending transfers: `/v3/sites/transfers/pending`
 
 ### Collection Endpoint
 The **Collection** endpoint returns a list of "sites" associated with the login. Presumably these are separate installations perhaps at different addresses. These are called _Locations_ in the Comfort app.
@@ -156,11 +250,13 @@ Example:
 
 The important information here is `id` which is the `{site-id}` for several of the remaining API calls.
 
-### Pending Transfers
-In the app, a Location can be transferred to a new owner. This is done by email address, and this endpoint allows the app to notify a user about an incoming transfer request.
+As of October 2026 each site also has `role` (e.g. `"owner"`), `isDemo` and `demoEndsAt`.
 
-### Unseen Notifications
-This populates the Red Dot on the Notification Bell in the Comfort app.
+### Collection with addresses
+`/v3/sites/full` returns the same list with each site's postal address and `requiresAddressUpdate`, i.e. the same fields as [`sites/{site-id}`](#sitessite-id). Mind the street address when sharing captures.
+
+### Pending Transfers
+In the app, a Location can be transferred to a new owner. This is done by email address, and this endpoint allows the app to notify a user about an incoming transfer request. Returns `[]` when there are none.
 
 ## Site endpoints
 
@@ -169,6 +265,10 @@ This populates the Red Dot on the Notification Bell in the Comfort app.
 - /v3/sites/{site-id}/kumo-station
 - /v3/sites/{site-id}/zones
 - /v3/sites/{site-id}/groups
+- /v3/sites/{site-id}/weather
+- /v3/sites/{site-id}/dr-programs
+- /v3/sites/{site-id}/program-enroll
+- /v4/sites/{site-id}/schedule-seasons
 
 `{site-id}` is the `id` GUID returned from the `/v3/sites/` collection endpoint.
 
@@ -299,8 +399,67 @@ Available values in the app: 30 minutes, 1, 2, 3, 4 hours
 ]
 ```
 
+As of October 2026 each zone also has a `holdMode` object, and its `adapter` has `scheduleHoldEndTime`, `previousOperationMode`, `mhk2DisconnectedAt` and `isIoT`:
+```
+"holdMode": {
+    "id": "<hold-id>",
+    "enabled": false,
+    "type": "hold",
+    "holdType": null,
+    "endTime": "2026-03-13T00:03:08.710Z",
+    "operationMode": null,
+    "fanSpeed": null,
+    "airDirection": null,
+    "spCool": null,
+    "spHeat": null
+},
+"hasActiveSchedule": false
+```
+
 ### sites/{site-id}/kumo-station
-Description TBD. (I get `"error": "kumoStationNotFound"`)
+Description TBD. (I get `"error": "kumoStationNotFound"`, with HTTP 404.) The app adds `?refresh=true` or `?refresh=false`.
+
+### sites/{site-id}/weather
+Current weather at the site, passed through from OpenWeatherMap's current-weather API (`coord`, `weather`, `main`, `wind`, `clouds`, `sys`, `name`, `cod`, ...). `main.temp` is in °C.
+
+### sites/{site-id}/dr-programs and sites/{site-id}/program-enroll
+Demand-response (utility) programs available to, and enrolled by, the site. Both returned `[]`.
+
+### v4/sites/{site-id}/schedule-seasons
+Schedule seasons. The app uses `/v4/` for schedules; the login response's `scheduleVersion` is `"v2"`.
+```
+[
+    {
+        "id": "<season-id>",
+        "name": "Summer",
+        "isRunning": true,
+        "isDefault": true,
+        "hasSchedules": false,
+        "createdAt": "2026-05-05T19:52:03.724Z",
+        "updatedAt": "2026-05-05T19:52:03.724Z"
+    },
+    {
+        "id": "<season-id>",
+        "name": "Winter",
+        "isRunning": false,
+        "isDefault": false,
+        "hasSchedules": false,
+        ...
+    }
+]
+```
+
+### v4/schedule-seasons/{season-id}/schedules
+One entry per zone, with its schedule `events` (empty here).
+```
+[
+    {
+        "id": "<schedule-id>",
+        "zone": {"id": "<zone-id>", "name": "<redacted>"},
+        "events": []
+    }
+]
+```
 
 ## Group endpoints
 
@@ -350,7 +509,10 @@ Description TBD. (I get `"error": "kumoStationNotFound"`)
 ## Zone endpoints
 
 **Endpoints**
-- /v3/zones/{zone-id}
+- /v3/zones/{zone-id} (GET, PATCH)
+- /v3/zones/{zone-id}/connection-history
+- /v3/zones/{zone-id}/notification-preferences
+- /v3/zones/{zone-id}/reset-filter (PATCH)
 
 `{zone-id}` is the `id` GUID returned by the `/v3/sites/{site-id}/zones` endpoint
 
@@ -396,6 +558,53 @@ Description TBD. (I get `"error": "kumoStationNotFound"`)
 }
 ```
 
+### PATCH zones/{zone-id}
+Renames a zone. The response is the updated zone, as for GET.
+```
+{"id": "<zone-id>", "name": "<new-name>", "siteId": "<site-id>"}
+```
+
+### zones/{zone-id}/connection-history
+The adapter's cloud connection history, newest first, paged (`next`, `previous`, `count`, `data`):
+```
+{
+    "next": null,
+    "previous": null,
+    "count": 20,
+    "data": [
+        {"start": "2026-10-03T23:20:32.029Z", "end": null, "isConnected": true, "uptime": "18h"},
+        {"start": "2026-10-03T01:45:15.927Z", "end": "2026-10-03T23:19:50.906Z", "isConnected": false, "uptime": "22h"},
+        ...
+    ]
+}
+```
+
+### zones/{zone-id}/notification-preferences
+```
+{
+    "id": "<preferences-id>",
+    "zoneId": "<zone-id>",
+    "accountId": "<user-id>",
+    "enabled": true,
+    "filterDirty": true,
+    "zoneError": true,
+    "lowTempEnabled": true,
+    "lowTemp": 0,
+    "highTempEnabled": true,
+    "highTemp": 40,
+    "sensorSignalLost": true,
+    "sensorLowBattery": true,
+    "mhk2LowBattery": true,
+    "system": true,
+    "drEvent": false,
+    "filterDirtyReminderInterval": 30,
+    "filterDirtyReminderLastSent": "2026-09-14T07:28:55.735Z"
+}
+```
+
+### PATCH zones/{zone-id}/reset-filter
+Clears the dirty-filter indication. No body. The response is `{"preferences": {...}}`, the notification preferences above (without `zoneId` and `accountId`), with `filterDirtyReminderLastSent` set to now.
+
 ## Per-device
 
 **Endpoints**
@@ -404,13 +613,16 @@ Description TBD. (I get `"error": "kumoStationNotFound"`)
 - /v3/devices/{device-serial}/status
 - /v3/devices/{device-serial}/initial-settings
 - /v3/devices/{device-serial}/kumo-properties
+- /v3/devices/{device-serial}/mhk2
+- /v3/devices/send-command (POST, see [Commands](#commands))
+- /v3/devices/{device-serial}/relay-command (POST, see [Commands](#commands))
 
 These endpoints return information per device (indoor unit).
 
 `{device-serial}` is the `adapter.deviceSerial` field returned by the `/v3/sites/{site-id}/zones` endpoint.
 These endpoints return operational data for each indoor unit similar to that returned by the local API.
 
-Importantly, the `status` endpoint returns the `cryptoSerial` value, required for local communication with the indoor unit. (As of October 2026 it no longer does; see [WebSocket interface](#websocket-interface).)
+Importantly, the `status` endpoint returns the `cryptoSerial` value, required for local communication with the indoor unit. (As of October 2026 it no longer does, not even to the official app; see [WebSocket interface](#websocket-interface).)
 
 ### devices/{device-serial}
 ```
@@ -533,6 +745,20 @@ Importantly, the `status` endpoint returns the `cryptoSerial` value, required fo
 }
 ```
 
+As of October 2026, for a ducted unit with no MHK2 on firmware `02.06.26`, the response was only the following. Some of the missing fields (`receiverRelay`, `modeHeat`) may depend on the installation rather than having been removed; `cryptoSerial` and `cryptoKeySet` are gone for every unit seen.
+```
+{
+    "firmwareVersion": "02.06.26",
+    "roomTempDisplayOffset": 0,
+    "routerSsid": "<redacted>",
+    "routerRssi": -51,
+    "minSetPoint": 19.5,
+    "maxSetPoint": 28,
+    "lastUpdated": "2026-10-03T15:18:12.015Z",
+    "mac": "<adapter-mac>"
+}
+```
+
 ### devices/{device-serial}/initial-settings
 ```
 [
@@ -561,3 +787,59 @@ Importantly, the `status` endpoint returns the `cryptoSerial` value, required fo
     "lastUpdated": "2025-04-09T20:24:45.093Z"
 }
 ```
+
+### devices/{device-serial}/mhk2
+The MHK2 wireless controller paired with the unit. Without one, HTTP 404 and `{"error": "mhk2NotFound"}`.
+
+## Commands
+
+The Comfort app (October 2026) controls units through the cloud, not through their local API. Commands are POSTed with the access token, and the resulting state arrives as Socket.IO `device_update` events (see [`realValues`](#observed-in-a-capture-of-the-comfort-app-october-2026)).
+
+### devices/send-command
+Changes a unit's operating state.
+```
+{
+    "deviceSerial": "<device-serial>",
+    "deviceCommands": {
+        "<device-serial>": {"operationMode": "dry", "spCool": 24.5, "spHeat": 24}
+    }
+}
+```
+Response:
+```
+{"devices": ["<device-serial>"]}
+```
+Fields seen in `deviceCommands`: `operationMode` (`dry`, `off`), `fanSpeed` (`quiet`, `low`, `powerful`, `auto`), `spCool`, `spHeat`. The app sent the setpoints along with the switch to `dry`, and `operationMode: "off"` alone to turn the unit off. The mode values are presumably the same as `operationMode` in `device_update` (which also reports `cool` and `vent`). `deviceCommands` is keyed by serial, which suggests one call can command several units; only single-unit calls have been seen.
+
+### devices/{device-serial}/relay-command
+Changes adapter settings. Seen toggling the adapter LED:
+```
+{"serial": "<device-serial>", "adapter": {"status": {"ledDisabled": true}}}
+```
+The response echoes the command without `serial`:
+```
+{"adapter": {"status": {"ledDisabled": true}}}
+```
+The body after `serial` has the shape of the adapter's local API commands (the contents of the local API's `"c"` object; pykumo reads the same `adapter.status` object locally). But it is not a general pass-through to the local API: the cloud checks the body against a schema of known settings and their types, and forwards writes only. Tested by hand in October 2026:
+
+| Body after `serial` | Result |
+|---|---|
+| `{"adapter": {"status": {"ledDisabled": false}}}` | 200; the LED setting changed |
+| `{"adapter": {"status": {}}}` (local-API read of the whole object) | 400 |
+| `{"adapter": {"status": {"ledDisabled": {}}}}` (local-API read of one field) | 400 |
+| `{"c": {"adapter": {"status": {}}}}` (local-API wrapper) | 400 |
+| `{"adapter": {"status": {"ledDisabled": null}}}` | 400 |
+
+The 400 for `null` came with `{"error": {"adapter": "Expected boolean, received null"}}`, a [Zod](https://zod.dev)-style validation message. So the relay can't read anything from the adapter, and in particular can't recover the adapter password or `cryptoSerial`. Settings other than `ledDisabled` haven't been tried.
+
+## Errors
+
+Errors come back as `{"error": "<code>"}`, except body validation errors, where `error` is an object of messages keyed by field (see [relay-command](#devicesdevice-serialrelay-command)). Codes seen:
+
+| HTTP | `error` | When |
+|---|---|---|
+| 400 | `{"adapter": "Expected boolean, received null"}` | `relay-command` with a body the schema rejects. |
+| 401 | `notAuthorized` | Expired access token. The app then calls `/v3/refresh` and retries. |
+| 401 | `notAuthToken` | No usable token, e.g. after `/v3/logout`. |
+| 404 | `kumoStationNotFound` | `sites/{site-id}/kumo-station` on a site without one. |
+| 404 | `mhk2NotFound` | `devices/{device-serial}/mhk2` on a unit without one. |
