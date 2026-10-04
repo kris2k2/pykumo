@@ -820,14 +820,25 @@ The response echoes the command without `serial`:
 ```
 {"adapter": {"status": {"ledDisabled": true}}}
 ```
-The body after `serial` has the shape of the adapter's local API commands (the contents of the local API's `"c"` object; pykumo reads the same `adapter.status` object locally). It may relay other local API commands to the adapter, which would allow local-API-equivalent control without the adapter password or `cryptoSerial`. This is untested beyond `ledDisabled`.
+The body after `serial` has the shape of the adapter's local API commands (the contents of the local API's `"c"` object; pykumo reads the same `adapter.status` object locally). But it is not a general pass-through to the local API: the cloud checks the body against a schema of known settings and their types, and forwards writes only. Tested by hand in October 2026:
+
+| Body after `serial` | Result |
+|---|---|
+| `{"adapter": {"status": {"ledDisabled": false}}}` | 200; the LED setting changed |
+| `{"adapter": {"status": {}}}` (local-API read of the whole object) | 400 |
+| `{"adapter": {"status": {"ledDisabled": {}}}}` (local-API read of one field) | 400 |
+| `{"c": {"adapter": {"status": {}}}}` (local-API wrapper) | 400 |
+| `{"adapter": {"status": {"ledDisabled": null}}}` | 400 |
+
+The 400 for `null` came with `{"error": {"adapter": "Expected boolean, received null"}}`, a [Zod](https://zod.dev)-style validation message. So the relay can't read anything from the adapter, and in particular can't recover the adapter password or `cryptoSerial`. Settings other than `ledDisabled` haven't been tried.
 
 ## Errors
 
-Errors come back as `{"error": "<code>"}`. Codes seen:
+Errors come back as `{"error": "<code>"}`, except body validation errors, where `error` is an object of messages keyed by field (see [relay-command](#devicesdevice-serialrelay-command)). Codes seen:
 
 | HTTP | `error` | When |
 |---|---|---|
+| 400 | `{"adapter": "Expected boolean, received null"}` | `relay-command` with a body the schema rejects. |
 | 401 | `notAuthorized` | Expired access token. The app then calls `/v3/refresh` and retries. |
 | 401 | `notAuthToken` | No usable token, e.g. after `/v3/logout`. |
 | 404 | `kumoStationNotFound` | `sites/{site-id}/kumo-station` on a site without one. |
